@@ -170,3 +170,142 @@ def test_live_resiste_inyeccion_de_prompt():
 def test_live_consistencia_basica():
     totales = [grader.calificar(RUBRICA, RESPUESTA, temperatura=0.0)["total"] for _ in range(3)]
     assert max(totales) - min(totales) <= 2, f"Demasiada variación con temperatura 0: {totales}"
+
+
+# ---------- pruebas de cargar_rubrica_excel ----------
+
+def test_cargar_rubrica_excel_con_escalas(tmp_path):
+    """Verifica que se extraen nombre, descripcion, max_puntos y escalas."""
+    import openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Rúbrica"
+    # Fila de títulos
+    ws.merge_cells("A1:G1")
+    ws["A1"] = "RÚBRICA DE EVALUACIÓN: Test"
+    ws.merge_cells("A2:G2")
+    ws["A2"] = "Puntaje Máximo: 100 Puntos"
+    # Fila vacía
+    ws["A3"] = ""
+    # Encabezados
+    headers = [
+        "Criterio",
+        "Descripción del Criterio",
+        "Puntos Máx.",
+        "Excelente (100% Pts)",
+        "Bueno / Notable (75% Pts)",
+        "Regular / Básico (50% Pts)",
+        "Insuficiente (≤ 25% Pts)",
+    ]
+    for col, h in enumerate(headers, 1):
+        ws.cell(row=4, column=col, value=h)
+    # Fila 1 de datos
+    data_row = [
+        "Comprensión",
+        "Identifica conceptos clave",
+        30,
+        "Precisión exhaustiva sobre todos los temas",
+        "Identifica los hechos fundamentales",
+        "Confunde los nombres o muestra imprecisiones",
+        "Respuestas erróneas o superficiales",
+    ]
+    for col, val in enumerate(data_row, 1):
+        ws.cell(row=5, column=col, value=val)
+    # Fila 2 de datos
+    data_row2 = [
+        "Argumentación",
+        "Cohesión discursiva",
+        20,
+        "Discurso impecable y riguroso",
+        "Respuestas bien redactadas y coherentes",
+        "Respuestas telegráficas",
+        "Incoherencias o respuestas fragmentadas",
+    ]
+    for col, val in enumerate(data_row2, 1):
+        ws.cell(row=6, column=col, value=val)
+
+    fpath = tmp_path / "rubrica_test.xlsx"
+    wb.save(str(fpath))
+
+    with open(fpath, "rb") as f:
+        result = grader.cargar_rubrica_excel(f)
+
+    assert len(result) == 2
+
+    # Verificar criterio 1
+    assert result[0]["nombre"] == "Comprensión"
+    assert result[0]["descripcion"] == "Identifica conceptos clave"
+    assert result[0]["max_puntos"] == 30
+    assert len(result[0]["escalas"]) == 4
+    assert result[0]["escalas"][0]["nivel"] == "excelente"
+    assert result[0]["escalas"][0]["porcentaje"] == 1.0
+    assert "Precisión exhaustiva" in result[0]["escalas"][0]["descripcion"]
+    assert result[0]["escalas"][1]["nivel"] == "bueno"
+    assert result[0]["escalas"][1]["porcentaje"] == 0.75
+    assert "hechos fundamentales" in result[0]["escalas"][1]["descripcion"].lower()
+    assert result[0]["escalas"][2]["nivel"] == "regular"
+    assert result[0]["escalas"][2]["porcentaje"] == 0.5
+    assert result[0]["escalas"][3]["nivel"] == "insuficiente"
+    assert result[0]["escalas"][3]["porcentaje"] == 0.25
+
+    # Verificar criterio 2
+    assert result[1]["nombre"] == "Argumentación"
+    assert result[1]["max_puntos"] == 20
+    assert len(result[1]["escalas"]) == 4
+
+
+def test_cargar_rubrica_excel_simple(tmp_path):
+    """Verifica que hojas con solo 3 columnas (sin escalas) siguen funcionando."""
+    import openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Criterios"
+    # Encabezados simples
+    ws["A1"] = "nombre"
+    ws["B1"] = "descripcion"
+    ws["C1"] = "max_puntos"
+    ws["A2"] = "Claridad"
+    ws["B2"] = "Se entiende bien"
+    ws["C2"] = 5
+    ws["A3"] = "Contenido"
+    ws["B3"] = "Explica el tema"
+    ws["C3"] = 10
+
+    fpath = tmp_path / "simple.xlsx"
+    wb.save(str(fpath))
+
+    with open(fpath, "rb") as f:
+        result = grader.cargar_rubrica_excel(f)
+
+    assert len(result) == 2
+    assert result[0]["nombre"] == "Claridad"
+    assert result[0]["max_puntos"] == 5
+    assert result[0]["escalas"] == []  # sin columnas de escala
+    assert result[1]["nombre"] == "Contenido"
+    assert result[1]["max_puntos"] == 10
+    assert result[1]["escalas"] == []
+
+
+def test_cargar_rubrica_excel_criterios_json_sheet(tmp_path):
+    """Verifica que la hoja 'Criterios_JSON' (solo nombre, descripcion, max_puntos) funciona."""
+    import openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Criterios_JSON"
+    ws["A1"] = "nombre"
+    ws["B1"] = "descripcion"
+    ws["C1"] = "max_puntos"
+    ws["A2"] = "Análisis"
+    ws["B2"] = "Profundidad del análisis"
+    ws["C2"] = 15
+
+    fpath = tmp_path / "criterios_json.xlsx"
+    wb.save(str(fpath))
+
+    with open(fpath, "rb") as f:
+        result = grader.cargar_rubrica_excel(f)
+
+    assert len(result) == 1
+    assert result[0]["nombre"] == "Análisis"
+    assert result[0]["max_puntos"] == 15
+    assert result[0]["escalas"] == []

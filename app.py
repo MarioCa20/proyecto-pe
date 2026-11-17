@@ -2,9 +2,11 @@
 import json
 import os
 import uuid
+import io
 from datetime import datetime
 from pathlib import Path
 
+import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
@@ -32,7 +34,7 @@ if not os.getenv("GEMINI_API_KEY"):
 # ---------------------------------------------------------------------------
 # Importar backend
 # ---------------------------------------------------------------------------
-from src.grader import calificar
+from src.grader import calificar, calificar_multipartida
 
 # ---------------------------------------------------------------------------
 # Datos iniciales
@@ -254,7 +256,7 @@ with st.sidebar:
 # ---------------------------------------------------------------------------
 # Pestañas principales
 # ---------------------------------------------------------------------------
-tab_evaluar, tab_historial = st.tabs(["📝 Evaluar", "📊 Historial"])
+tab_evaluar, tab_masiva, tab_historial = st.tabs(["📝 Evaluar", "📚 Calificación masiva", "📊 Historial"])
 
 # ===================================================================
 # TAB 1: EVALUAR
@@ -413,6 +415,13 @@ with tab_evaluar:
     resultado: dict = {}  # type: ignore[assignment]
 
     if boton_calificar:
+        texto_final = respuesta_input.strip()
+        if pregunta_input.strip():
+            texto_final = (
+                f"PREGUNTA:\n{pregunta_input.strip()}\n\n"
+                f"RESPUESTA:\n{texto_final}"
+            )
+
         if st.session_state.modo_demo:
             with st.spinner("🎭 Simulando calificación en modo demo..."):
                 resultado = CALIFICACION_DEMO.copy()
@@ -429,13 +438,6 @@ with tab_evaluar:
                 f"🔄 Evaluando con Gemini (prompt `{version_prompt}`)..."
             ):
                 try:
-                    texto_final = respuesta_input.strip()
-                    if pregunta_input.strip():
-                        texto_final = (
-                            f"PREGUNTA:\n{pregunta_input.strip()}\n\n"
-                            f"RESPUESTA:\n{texto_final}"
-                        )
-
                     resultado = calificar(
                         rubrica=rubrica_limpia,
                         respuesta=texto_final,
@@ -459,6 +461,8 @@ with tab_evaluar:
             "nota_humana": nota_humana if (comparar_humano and rubrica_limpia) else None,
             "comparar_humano": comparar_humano,
             "simulada": st.session_state.modo_demo,
+            "estudiante": "Individual",
+            "respuesta": texto_final if not st.session_state.modo_demo else "[demo]",
         }
         st.session_state.historial.insert(0, entrada)
 
@@ -547,7 +551,198 @@ with tab_evaluar:
             )
 
 # ===================================================================
-# TAB 2: HISTORIAL
+# TAB 2: CALIFICACIÓN MASIVA
+# ===================================================================
+with tab_masiva:
+    st.title("📚 Calificación masiva de estudiantes")
+    st.caption(
+        "Sube un `.xlsx` con las respuestas de varios estudiantes y califícalas todas "
+        "de una vez con la rúbrica configurada."
+    )
+
+    # --- Instrucciones de formato ---
+    st.info(
+        "**Formato del archivo xlsx:**\n"
+        "- Columna **estudiante** (o *nombre_estudiante*, *nombre*): nombre del estudiante.\n"
+        "- Columna **respuesta**: texto de la respuesta.\n"
+        "- Columna opcional **nota_humana**: nota que asignaste manualmente.\n\n"
+        "Puedes usar la rúbrica cargada arriba o la predeterminada."
+    )
+
+    # --- Configurar cantidad de intentos ---
+    col_attempts, col_demo2 = st.columns(2)
+    with col_attempts:
+        max_reintentos = st.number_input(
+            "🔄 Max. reintentos por respuesta",
+            min_value=1,
+            max_value=10,
+            value=3,
+            step=1,
+            help="Si la API falla, se reintentará hasta esta cantidad.",
+        )
+    with col_demo2:
+        demo_masiva = st.toggle(
+            "🎭 Modo demo",
+            value=False,
+            help="Califica sin gastar cuota de API.",
+        )
+
+    # --- Validar rúbrica ---
+    rubrica_limpia_masiva = [
+        {
+            "nombre": str(fila["nombre"]).strip(),
+            "descripcion": str(fila.get("descripcion") or "").strip(),
+            "max_puntos": float(fila["max_puntos"]),
+        }
+        for fila in rubrica_editada
+        if fila.get("nombre") and str(fila["nombre"]).strip() and fila.get("max_puntos")
+    ]
+
+    if not rubrica_limpia_masiva:
+        st.warning("⚠️ Define al menos un criterio en la rúbrica antes de calificar masivamente.")
+
+    puntaje_max_masiva = sum(c["max_puntos"] for c in rubrica_limpia_masiva)
+
+    # --- Subir archivo de respuestas ---
+    archivo_respuestas = st.file_uploader(
+        "📄 Subir respuestas de estudiantes (.xlsx)",
+        type=["xlsx"],
+        key="file_respuestas",
+        help="Cada fila es un estudiante con su respuesta.",
+    )
+
+    # --- Procesar xlsx ---
+    respuestas_cargadas: list[dict] = []
+    if archivo_respuestas is not None:
+        try:
+            from src.grader import cargar_respuestas_excel
+            archivo_respuestas.seek(0)
+            respuestas_cargadas = cargar_respuestas_excel(archivo_respuestas)
+            if not respuestas_cargadas:
+                st.error("❌ No se encontraron filas válidas en el xlsx.")
+            else:
+                st.success(f"✅ {len(respuestas_cargadas)} respuesta(s) detectada(s).")
+        except Exception as e:
+            st.error(f"❌ No se pudo leer el archivo: `{e}`")
+
+    # --- Botón calificar masiva ---
+    boton_masivo = st.button(
+        "🚀 Calificar todos",
+        type="primary",
+        use_container_width=True,
+        disabled=not respuestas_cargadas or not rubrica_limpia_masiva,
+    )
+
+    # --- Resultados masivos ---
+    if boton_masivo and respuestas_cargadas and rubrica_limpia_masiva:
+        resultados_masivos = []
+
+        if demo_masiva:
+            with st.spinner("🎭 Simulando calificación masiva..."):
+                for resp in respuestas_cargadas:
+                    demo = CALIFICACION_DEMO.copy()
+                    nuevo_max = puntaje_max_masiva
+                    demo["total_max"] = nuevo_max
+                    demo["total"] = sum(c["puntaje"] for c in demo["criterios"])
+                    for c in demo["criterios"]:
+                        c["max_puntos"] = nuevo_max // len(demo["criterios"])
+                    resultados_masivos.append({
+                        "nombre": resp["nombre"],
+                        "nota_humana": resp.get("nota_humana"),
+                        "respuesta": resp["respuesta"],
+                        **demo,
+                        "error": None,
+                    })
+        else:
+            with st.spinner(f"🔄 Evaluando {len(respuestas_cargadas)} respuesta(s)..."):
+                try:
+                    resultados_masivos = calificar_multipartida(
+                        rubrica=rubrica_limpia_masiva,
+                        respuestas=respuestas_cargadas,
+                        version_prompt=version_prompt,
+                        temperatura=temperatura,
+                        reintentos=max_reintentos,
+                    )
+                except Exception as e:
+                    st.error(f"❌ Error al evaluar: `{e}`")
+                    resultados_masivos = []
+
+        if resultados_masivos:
+            st.divider()
+            st.subheader("📊 Resultados de calificación masiva")
+
+            # Tabla resumen
+            resumen_rows = []
+            for r in resultados_masivos:
+                fila = {
+                    "Estudiante": r["nombre"],
+                    "Puntaje": f'{r["total"]}/{r["total_max"]}' if r["total"] is not None else "❌ Error",
+                }
+                if r.get("nota_humana") is not None:
+                    diff = (r["total"] or 0) - r["nota_humana"]
+                    fila["Diferencia"] = f"{diff:+g}" if r["total"] is not None else "—"
+                if r.get("error"):
+                    fila["Error"] = "Sí"
+                resumen_rows.append(fila)
+
+            # Guardar en historial (una entrada por resultado, en orden con respuestas_cargadas)
+            for r, resp in zip(resultados_masivos, respuestas_cargadas):
+                entrada = {
+                    "id": str(uuid.uuid4())[:8],
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    "version_prompt": version_prompt,
+                    "temperatura": temperatura,
+                    "total": r.get("total"),
+                    "total_max": r["total_max"],
+                    "comentario_general": r.get("comentario_general", ""),
+                    "criterios": r.get("criterios", []),
+                    "nota_humana": r.get("nota_humana"),
+                    "comparar_humano": False,
+                    "simulada": demo_masiva,
+                    "estudiante": r["nombre"],
+                    "respuesta": r.get("respuesta", "") if demo_masiva else resp["respuesta"],
+                    "meta": r.get("meta", {}),
+                }
+                st.session_state.historial.insert(0, entrada)
+
+            resumen_df = pd.DataFrame(resumen_rows)
+            st.dataframe(resumen_df, use_container_width=True, hide_index=True)
+
+            # Botón descargar xlsx con todos los resultados
+            if not demo_masiva:
+                # Convertir a xlsx con desglose
+                excel_buf = io.BytesIO()
+                with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
+                    resumen_df.to_excel(writer, index=False, sheet_name="Resumen")
+
+                    # Hoja con desglose por criterio
+                    desglose_rows = []
+                    for r in resultados_masivos:
+                        for c in r.get("criterios", []):
+                            desglose_rows.append({
+                                "Estudiante": r["nombre"],
+                                "Criterio": c["criterio"],
+                                "Puntaje": c["puntaje"],
+                                "Máximo": c["max_puntos"],
+                                "Justificación": c.get("justificacion", ""),
+                            })
+                    if desglose_rows:
+                        df_desglose = pd.DataFrame(desglose_rows)
+                        df_desglose.to_excel(writer, index=False, sheet_name="Desglose")
+
+                excel_buf.seek(0)
+                st.download_button(
+                    label="💾 Descargar resultados (xlsx)",
+                    data=excel_buf,
+                    file_name=f"calificaciones_{version_prompt}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+
+            st.caption(f"**{sum(1 for r in resultados_masivos if not r.get('error'))}/{len(resultados_masivos)}** calificación(es) exitosa(s).")
+
+# ===================================================================
+# TAB 3: HISTORIAL
 # ===================================================================
 with tab_historial:
     st.title("📊 Historial de Calificaciones")
@@ -562,38 +757,71 @@ with tab_historial:
         st.markdown(f"**{len(historial)} calificación(es) en esta sesión**")
 
         for i, entry in enumerate(historial):
-            etiqueta = f"📄 #{i + 1} — {entry['total']:g}/{entry['total_max']} pts — {entry['timestamp']}"
+            est = entry.get("estudiante", "Individual")
+            label_est = f" — {est}" if est != "Individual" else ""
+            total_str = (
+                f'{entry["total"]}/{entry["total_max"]}'
+                if entry.get("total") is not None
+                else "❌ Error"
+            )
+            etiqueta = f"📄 #{i + 1} — {total_str} pts — {entry['timestamp']}{label_est}"
             if entry.get("simulada"):
                 etiqueta += " (demo)"
             with st.expander(etiqueta, expanded=False):
-                col_info1, col_info2, col_info3 = st.columns(3)
-                col_info1.metric(
-                    "Puntaje IA", f"{entry['total']} / {entry['total_max']}"
-                )
+                # --- Estudiante + puntaje ---
+                col_est, col_pts, col_params = st.columns(3)
+                with col_est:
+                    st.markdown(f"**👤 {est}**")
+                with col_pts:
+                    st.metric("Puntaje IA", f'{entry["total"]}/{entry["total_max"]}' if entry.get("total") is not None else "❌ Error")
                 if entry.get("comparar_humano") and entry.get("nota_humana") is not None:
                     diff = entry["total"] - entry["nota_humana"]
-                    col_info2.metric(
-                        "Nota Humana",
-                        f"{entry['nota_humana']} / {entry['total_max']}",
-                    )
-                    col_info3.metric("Diferencia", f"{diff:+g} pts")
+                    col_pts.metric("Nota Humana", f'{entry["nota_humana"]}/{entry["total_max"]}')
+                    col_params.metric("Diferencia", f"{diff:+g} pts")
                 else:
-                    col_info2.metric("Prompt", entry.get("version_prompt", "?"))
-                    col_info3.metric("Temperatura", entry.get("temperatura", 0))
+                    col_pts.metric("Prompt", entry.get("version_prompt", "?"))
+                    col_params.metric("Temperatura", entry.get("temperatura", 0))
 
+                # --- Respuesta del estudiante ---
+                if entry.get("respuesta"):
+                    st.markdown("**📝 Respuesta del estudiante:**")
+                    st.info(entry["respuesta"])
+
+                # --- Comentario general ---
                 if entry.get("comentario_general"):
-                    st.info(f"**💬 {entry['comentario_general']}")
+                    st.info(f"💬 {entry['comentario_general']}")
 
-                st.subheader("Desglose por criterio:")
-                for crit in entry.get("criterios", []):
-                    pct = (
-                        crit["puntaje"] / crit["max_puntos"]
-                        if crit["max_puntos"] > 0
-                        else 0
+                # --- Desglose por criterio ---
+                criterios = entry.get("criterios", [])
+                if criterios:
+                    st.subheader("📋 Desglose por criterio:")
+                    for crit in criterios:
+                        crit_nombre = crit.get("criterio", "Sin nombre")
+                        puntaje = crit.get("puntaje", 0)
+                        max_p = crit.get("max_puntos", 0)
+                        justificacion = crit.get("justificacion", "")
+                        pct = puntaje / max_p if max_p > 0 else 0
+
+                        if pct >= 0.8:
+                            emoji = "✅"
+                        elif pct >= 0.5:
+                            emoji = "⚠️"
+                        else:
+                            emoji = "❌"
+
+                        with st.container():
+                            st.markdown(f"{emoji} **{crit_nombre}**: {puntaje} / {max_p}")
+                            st.progress(min(1.0, max(0.0, pct)))
+                            if justificacion:
+                                with st.expander(f"💡 Justificación de {crit_nombre}"):
+                                    st.write(justificacion)
+
+                # --- Meta info ---
+                meta = entry.get("meta", {})
+                if meta:
+                    st.caption(
+                        f"🔧 Modelo: `{meta.get('modelo', '?')}` • "
+                        f"Prompt: `{meta.get('prompt', '?')}` • "
+                        f"Temperatura: `{meta.get('temperatura', '?')}` • "
+                        f"Tiempo: `{meta.get('segundos', '?')}s`"
                     )
-                    st.progress(min(1.0, max(0.0, pct)))
-                    st.markdown(
-                        f"**{crit['criterio']}**: {crit['puntaje']} / {crit['max_puntos']}"
-                    )
-                    if crit.get("justificacion"):
-                        st.caption(crit["justificacion"])

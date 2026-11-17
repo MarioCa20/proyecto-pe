@@ -80,10 +80,41 @@ Cada criterio requiere un nombre, una descripción y un puntaje máximo:
 │   └── grader.py       # Lógica de calificación y cliente Gemini
 ├── prompts/            # Versiones del prompt de evaluación (v1–v4)
 ├── tests/              # Pruebas con pytest
+├── data/               # Datos de demo (ver sección «Datos de demo»)
 ├── requirements.txt
 ├── pytest.ini
 └── .env.example
 ```
+
+## Datos de demo
+
+La carpeta `data/` contiene material para probar la aplicación y ver el formato esperado de los archivos. Hay una carpeta por libro:
+
+```
+data/
+├── respuestas_estudiantes_prueba.xlsx   # Ejemplo de carga masiva
+├── 1984/
+│   ├── 1984 - George Orwell.pdf         # Texto del libro
+│   ├── cuestionario.docx                # Preguntas dirigidas a los estudiantes
+│   ├── rubrica.xlsx                     # Rúbrica de evaluación
+│   ├── respuestas/                      # Respuestas individuales en PDF
+│   └── respuestas_estudiantes.xlsx      # Respuestas en lote (solo algunos libros)
+├── la_metamorfosis/
+├── el_principito/
+└── ...                                  # 11 libros en total
+```
+
+Libros incluidos: 1984, Drácula, Dr. Jekyll y Mr. Hyde, El corazón delator, El fantasma de Canterville, El principito, Frankenstein, La metamorfosis, Lazarillo de Tormes, Narraciones extraordinarias y Rebelión en la granja.
+
+**Formatos de los archivos**
+
+| Archivo                          | Uso en la app                          | Estructura                                                                                                           |
+| -------------------------------- | -------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `rubrica.xlsx`                   | Pestaña **Evaluar** (cargar rúbrica)   | Criterio, Descripción, Puntos Máx. y descripción de cada nivel (Excelente, Bueno, Regular, Insuficiente).            |
+| `respuestas/*.pdf`               | Pestaña **Evaluar** (respuesta)        | Una respuesta de estudiante por PDF, nombrada `Respuesta_NN_Nombre_Apellido.pdf`.                                    |
+| `respuestas_estudiantes*.xlsx`   | Pestaña **Calificación masiva**        | Columnas `estudiante`, `respuesta` y `nota_humana` (nota de referencia para comparar con la calificación de la IA).  |
+
+> Los nombres de estudiantes en los datos de ejemplo son ficticios.
 
 ## Pruebas
 

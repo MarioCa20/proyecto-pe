@@ -28,7 +28,6 @@ cd proyecto-pe
 python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-pip install pypdf                # opcional: necesario para subir respuestas en PDF
 ```
 
 ## Configuración

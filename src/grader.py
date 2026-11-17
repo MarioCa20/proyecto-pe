@@ -13,34 +13,94 @@ MODELO = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")  # verifica el nombr
 client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
 
+def _remover_acentos(texto: str) -> str:
+    """Remover acentos y ñ para comparacion flexible de columnas."""
+    import unicodedata
+    texto = str(texto)  # asegurar que sea str
+    nfkc = unicodedata.normalize("NFKC", texto)
+    return "".join(c for c in nfkc if not unicodedata.combining(c))
+
+
+def _construir_instruccion_permisividad(indice_libertad: float) -> str:
+    """Construye la directriz de evaluación basada en el índice de libertad (permisividad)."""
+    return (
+        f"ÍNDICE DE LIBERTAD / PERMISIVIDAD: {indice_libertad:.1f} (escala 0.0 a 1.0)\n"
+        f"Directriz de evaluación según este índice:\n"
+        f"- 0.0 (Estricto): Sé riguroso y exigente. Aplica la rúbrica con estricto apego literal, penalizando imprecisiones, ambigüedades u omisiones.\n"
+        f"- 1.0 (Permisivo): Sé muy flexible, comprensivo y benevolente. Valora principalmente la intención y el entendimiento conceptual del estudiante, otorgando el beneficio de la duda ante redacción informal o errores menores.\n"
+        f"- Nivel actual ({indice_libertad:.1f}): Calibra tu nivel de rigurosidad y permisividad proporcionalmente a este valor."
+    )
+
+
 def cargar_rubrica_excel(archivo) -> list[dict]:
-    """Lee un .xlsx y lo convierte a [{nombre, descripcion, max_puntos}, ...].
+    """Lee un .xlsx y lo convierte a [{nombre, descripcion, max_puntos, escalas}, ...].
 
-    Formato esperado del xlsx:
-      Columna A:  nombre     (str)
-      Columna B:  descripcion (str)
-      Columna C:  max_puntos  (número)
-
-    La primera fila se usa como encabezados. Se omite cualquier fila vacía en
-    la columna 'nombre'.
+    Soporta:
+      - Archivos con hoja 'Criterios_JSON', 'Rúbrica' o primera hoja disponible.
+      - Encabezados en fila 1 o dentro de las primeras 10 filas.
+      - Columnas de criterios simples: nombre/criterio, descripción, max_puntos/puntos.
+      - Columnas de escalas opcionales: Excelente (100%), Bueno (75%), Regular (50%), Insuficiente (<=25%).
     """
+    import pandas as pd
 
-    df = pd.read_excel(archivo, sheet_name="Criterios_JSON")
+    xl = pd.ExcelFile(archivo)
+    sheet_name = None
+    if "Criterios_JSON" in xl.sheet_names:
+        sheet_name = "Criterios_JSON"
+    else:
+        for s in xl.sheet_names:
+            if "rubrica" in _remover_acentos(s).lower():
+                sheet_name = s
+                break
+        if sheet_name is None:
+            sheet_name = xl.sheet_names[0]
 
-    # Normalizar nombres de columnas (minúsculas, strip, asegurar str)
-    df.columns = df.columns.astype(str).str.strip().str.lower()
+    df_raw = pd.read_excel(xl, sheet_name=sheet_name, header=None)
 
-    # Mapeo flexible de nombres de columna
+    # Buscar fila de encabezados en las primeras 10 filas
+    indice_encabezado = 0
+    encabezado_encontrado = False
+    for idx in range(min(10, len(df_raw))):
+        non_null_vals = df_raw.iloc[idx].dropna()
+        if len(non_null_vals) < 2:
+            continue
+        fila_texto = " ".join(str(v).lower() for v in non_null_vals)
+        fila_limpia = _remover_acentos(fila_texto)
+        if any(k in fila_limpia for k in ("criterio", "nombre")):
+            indice_encabezado = idx
+            encabezado_encontrado = True
+            break
+
+    if encabezado_encontrado:
+        encabezados = [str(v).strip() for v in df_raw.iloc[indice_encabezado].values]
+        df = df_raw.iloc[indice_encabezado + 1:].reset_index(drop=True)
+        df.columns = encabezados
+    else:
+        df = df_raw
+
+    # Normalizar nombres de columnas
+    df.columns = df.columns.astype(str).str.strip()
+
     col_map = {}
-    for col in df.columns:
-        if any(k in col for k in ("nombre", "criterio")):
-            col_map.setdefault("nombre", col)
-        if any(k in col for k in ("descrip", "desc", "detalle")):
-            col_map.setdefault("descripcion", col)
-        if any(k in col for k in ("punto", "max", "punt", "valor")):
-            col_map.setdefault("max_puntos", col)
+    escalas_cols = []
 
-    # Fallback: si no se encontraron encabezados, usar posición (col A=nombre, B=desc, C=max)
+    for col in df.columns:
+        col_norm = _remover_acentos(col.lower())
+        if any(k in col_norm for k in ("nombre", "criterio")) and "nombre" not in col_map:
+            col_map["nombre"] = col
+        elif any(k in col_norm for k in ("descrip", "desc", "detalle")) and "descripcion" not in col_map:
+            col_map["descripcion"] = col
+        elif any(k in col_norm for k in ("punto", "max", "punt", "valor")) and "max_puntos" not in col_map:
+            col_map["max_puntos"] = col
+        elif "excelente" in col_norm:
+            escalas_cols.append(("excelente", 1.0, col))
+        elif any(k in col_norm for k in ("bueno", "notable")):
+            escalas_cols.append(("bueno", 0.75, col))
+        elif any(k in col_norm for k in ("regular", "basico")):
+            escalas_cols.append(("regular", 0.5, col))
+        elif "insuficiente" in col_norm:
+            escalas_cols.append(("insuficiente", 0.25, col))
+
     if not col_map:
         cols = df.columns.tolist()
         if len(cols) >= 3:
@@ -55,23 +115,32 @@ def cargar_rubrica_excel(archivo) -> list[dict]:
     rubrica = []
     for _, row in df.iterrows():
         nombre = str(row[col_map["nombre"]]).strip() if col_map.get("nombre") else ""
-        if not nombre:
+        if not nombre or nombre.lower() in ("nan", "none", ""):
             continue
-        rubrica.append({
+        try:
+            max_p = float(row[col_map["max_puntos"]]) if col_map.get("max_puntos") and pd.notna(row[col_map["max_puntos"]]) else 0.0
+        except (ValueError, TypeError):
+            max_p = 0.0
+
+        item = {
             "nombre": nombre,
             "descripcion": str(row[col_map.get("descripcion", "")]).strip()
-                           if col_map.get("descripcion") else "",
-            "max_puntos": float(row[col_map["max_puntos"]]) if col_map.get("max_puntos")
-                          else 0,
-        })
-    return rubrica
+                           if col_map.get("descripcion") and pd.notna(row[col_map["descripcion"]]) else "",
+            "max_puntos": max_p,
+            "escalas": [],
+        }
 
-def _remover_acentos(texto: str) -> str:
-    """Remover acentos y ñ para comparacion flexible de columnas."""
-    import unicodedata
-    texto = str(texto)  # asegurar que sea str
-    nfkc = unicodedata.normalize("NFKC", texto)
-    return "".join(c for c in nfkc if not unicodedata.combining(c))
+        if escalas_cols:
+            for nivel, pct, c_name in escalas_cols:
+                desc_esc = str(row[c_name]).strip() if pd.notna(row[c_name]) else ""
+                item["escalas"].append({
+                    "nivel": nivel,
+                    "porcentaje": pct,
+                    "descripcion": desc_esc,
+                })
+
+        rubrica.append(item)
+    return rubrica
 
 
 # --- Esquema de salida (Gemini lo fuerza a devolver JSON válido) ---
@@ -109,19 +178,31 @@ def _validar(cal: Calificacion, rubrica: list[dict]) -> dict:
 
 
 def calificar(rubrica: list[dict], respuesta: str,
-              version_prompt: str = "v1", temperatura: float = 0.0,
+              version_prompt: str = "v1", indice_libertad: float = 0.0,
+              temperatura: float | None = None,
               reintentos: int = 3) -> dict:
     """
     rubrica: [{"nombre": "Claridad", "descripcion": "...", "max_puntos": 5}, ...]
+    respuesta: texto de la respuesta del estudiante
+    version_prompt: versión del prompt (archivo en prompts/)
+    indice_libertad: 0.0 (estricto) a 1.0 (permisivo)
+    temperatura: alias compatible hacia atrás para indice_libertad
     Devuelve dict con criterios, total, y metadatos para la evaluación.
     """
+    if temperatura is not None:
+        indice_libertad = temperatura
+
     sistema = cargar_prompt(version_prompt)
-    contenido = (f"RÚBRICA:\n{json.dumps(rubrica, ensure_ascii=False, indent=2)}\n\n"
-                 f"RESPUESTA DEL ESTUDIANTE:\n<<<\n{respuesta}\n>>>")
+    instruccion_permisividad = _construir_instruccion_permisividad(indice_libertad)
+    contenido = (
+        f"RÚBRICA:\n{json.dumps(rubrica, ensure_ascii=False, indent=2)}\n\n"
+        f"{instruccion_permisividad}\n\n"
+        f"RESPUESTA DEL ESTUDIANTE:\n<<<\n{respuesta}\n>>>"
+    )
 
     config = types.GenerateContentConfig(
         system_instruction=sistema,
-        temperature=temperatura,
+        temperature=indice_libertad,
         response_mime_type="application/json",
         response_schema=Calificacion,
     )
@@ -132,9 +213,13 @@ def calificar(rubrica: list[dict], respuesta: str,
             t0 = time.time()
             r = client.models.generate_content(model=MODELO, contents=contenido, config=config)
             salida = _validar(r.parsed, rubrica)
-            salida["meta"] = {"modelo": MODELO, "prompt": version_prompt,
-                              "temperatura": temperatura,
-                              "segundos": round(time.time() - t0, 2)}
+            salida["meta"] = {
+                "modelo": MODELO,
+                "prompt": version_prompt,
+                "indice_libertad": indice_libertad,
+                "temperatura": indice_libertad,
+                "segundos": round(time.time() - t0, 2),
+            }
             return salida
         except errors.APIError as e:
             ultimo_error = e
@@ -227,7 +312,8 @@ def calificar_multipartida(
     rubrica: list[dict],
     respuestas: list[dict],
     version_prompt: str = "v1",
-    temperatura: float = 0.0,
+    indice_libertad: float = 0.0,
+    temperatura: float | None = None,
     reintentos: int = 3,
 ) -> list[dict]:
     """Califica una lista de respuestas de estudiantes.
@@ -236,6 +322,9 @@ def calificar_multipartida(
       nombre, criterios, total, total_max, comentario_general,
       nota_humana, meta, error (si hubo fallo).
     """
+    if temperatura is not None:
+        indice_libertad = temperatura
+
     resultados = []
     for idx, resp in enumerate(respuestas, 1):
         try:
@@ -243,7 +332,7 @@ def calificar_multipartida(
                 rubrica=rubrica,
                 respuesta=resp["respuesta"],
                 version_prompt=version_prompt,
-                temperatura=temperatura,
+                indice_libertad=indice_libertad,
                 reintentos=reintentos,
             )
             resultados.append({
@@ -260,7 +349,12 @@ def calificar_multipartida(
                 "criterios": [],
                 "comentario_general": f"",
                 "error": str(e),
-                "meta": {"modelo": MODELO, "prompt": version_prompt,
-                         "temperatura": temperatura, "segundos": 0},
+                "meta": {
+                    "modelo": MODELO,
+                    "prompt": version_prompt,
+                    "indice_libertad": indice_libertad,
+                    "temperatura": indice_libertad,
+                    "segundos": 0,
+                },
             })
     return resultados

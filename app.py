@@ -170,6 +170,7 @@ CALIFICACION_DEMO = {
     "meta": {
         "modelo": "demo (simulado)",
         "prompt": "v1",
+        "indice_libertad": 0.0,
         "temperatura": 0.0,
         "segundos": 0.01,
     },
@@ -214,13 +215,13 @@ with st.sidebar:
         help="Carpeta `prompts/`. Detecta automáticamente *.md.",
     )
 
-    temperatura = st.slider(
-        "🌡️ Temperatura",
+    indice_libertad = st.slider(
+        "🕊️ Índice de libertad",
         min_value=0.0,
         max_value=1.0,
         value=0.0,
         step=0.1,
-        help="0.0 = más determinista. 1.0 = más creativo/varied.",
+        help="Controla qué tan permisivo o flexible es el modelo al evaluar. 0.0 = Estricto y riguroso. 1.0 = Muy permisivo y flexible.",
     )
 
     st.divider()
@@ -442,7 +443,7 @@ with tab_evaluar:
                         rubrica=rubrica_limpia,
                         respuesta=texto_final,
                         version_prompt=version_prompt,
-                        temperatura=temperatura,
+                        indice_libertad=indice_libertad,
                     )
                 except Exception as e:
                     st.error(f"❌ Error al evaluar: `{e}`")
@@ -453,7 +454,8 @@ with tab_evaluar:
             "id": str(uuid.uuid4())[:8],
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
             "version_prompt": version_prompt,
-            "temperatura": temperatura,
+            "indice_libertad": indice_libertad,
+            "temperatura": indice_libertad,
             "total": resultado["total"],
             "total_max": resultado["total_max"],
             "comentario_general": resultado.get("comentario_general", ""),
@@ -529,10 +531,11 @@ with tab_evaluar:
                         st.write(item.get("justificacion", "Sin justificación."))
 
         meta = resultado.get("meta", {})
+        libertad_meta = meta.get("indice_libertad", meta.get("temperatura", "?"))
         st.caption(
             f"🔧 Modelo: `{meta.get('modelo', '?')}` • "
             f"Prompt: `{meta.get('prompt', '?')}` • "
-            f"Temperatura: `{meta.get('temperatura', '?')}` • "
+            f"Índice de libertad: `{libertad_meta}` • "
             f"Tiempo: `{meta.get('segundos', '?')}s`"
         )
 
@@ -660,7 +663,7 @@ with tab_masiva:
                         rubrica=rubrica_limpia_masiva,
                         respuestas=respuestas_cargadas,
                         version_prompt=version_prompt,
-                        temperatura=temperatura,
+                        indice_libertad=indice_libertad,
                         reintentos=max_reintentos,
                     )
                 except Exception as e:
@@ -691,7 +694,8 @@ with tab_masiva:
                     "id": str(uuid.uuid4())[:8],
                     "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
                     "version_prompt": version_prompt,
-                    "temperatura": temperatura,
+                    "indice_libertad": indice_libertad,
+                    "temperatura": indice_libertad,
                     "total": r.get("total"),
                     "total_max": r["total_max"],
                     "comentario_general": r.get("comentario_general", ""),
@@ -780,7 +784,10 @@ with tab_historial:
                     col_params.metric("Diferencia", f"{diff:+g} pts")
                 else:
                     col_pts.metric("Prompt", entry.get("version_prompt", "?"))
-                    col_params.metric("Temperatura", entry.get("temperatura", 0))
+                    col_params.metric(
+                        "Índice de libertad",
+                        entry.get("indice_libertad", entry.get("temperatura", 0)),
+                    )
 
                 # --- Respuesta del estudiante ---
                 if entry.get("respuesta"):
@@ -819,9 +826,10 @@ with tab_historial:
                 # --- Meta info ---
                 meta = entry.get("meta", {})
                 if meta:
+                    libertad_meta = meta.get("indice_libertad", meta.get("temperatura", "?"))
                     st.caption(
                         f"🔧 Modelo: `{meta.get('modelo', '?')}` • "
                         f"Prompt: `{meta.get('prompt', '?')}` • "
-                        f"Temperatura: `{meta.get('temperatura', '?')}` • "
+                        f"Índice de libertad: `{libertad_meta}` • "
                         f"Tiempo: `{meta.get('segundos', '?')}s`"
                     )

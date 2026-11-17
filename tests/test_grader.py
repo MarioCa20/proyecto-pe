@@ -94,8 +94,57 @@ def test_calificar_camino_feliz(monkeypatch, sin_espera):
 
     assert out["total"] == 12
     assert out["meta"]["modelo"] == grader.MODELO
+    assert out["meta"]["indice_libertad"] == 0.0
     assert out["meta"]["temperatura"] == 0.0
     assert fake.llamadas["n"] == 1
+
+
+def test_calificar_con_indice_libertad(monkeypatch, sin_espera):
+    captura = {}
+    def fake_generate(model, contents, config):
+        captura["contents"] = contents
+        captura["temperature"] = config.temperature
+        return SimpleNamespace(parsed=_cal(("Claridad", 5), ("Contenido", 9)))
+
+    monkeypatch.setattr(grader.client.models, "generate_content", fake_generate)
+
+    out = grader.calificar(RUBRICA, RESPUESTA, indice_libertad=0.8)
+    assert out["meta"]["indice_libertad"] == 0.8
+    assert out["meta"]["temperatura"] == 0.8
+    assert "ÍNDICE DE LIBERTAD / PERMISIVIDAD: 0.8" in captura["contents"]
+    assert captura["temperature"] == 0.8
+
+
+def test_calificar_alias_temperatura(monkeypatch, sin_espera):
+    captura = {}
+    def fake_generate(model, contents, config):
+        captura["contents"] = contents
+        captura["temperature"] = config.temperature
+        return SimpleNamespace(parsed=_cal(("Claridad", 4), ("Contenido", 7)))
+
+    monkeypatch.setattr(grader.client.models, "generate_content", fake_generate)
+
+    out = grader.calificar(RUBRICA, RESPUESTA, temperatura=0.6)
+    assert out["meta"]["indice_libertad"] == 0.6
+    assert out["meta"]["temperatura"] == 0.6
+    assert "ÍNDICE DE LIBERTAD / PERMISIVIDAD: 0.6" in captura["contents"]
+    assert captura["temperature"] == 0.6
+
+
+def test_calificar_multipartida_con_indice_libertad(monkeypatch, sin_espera):
+    captura = []
+    def fake_generate(model, contents, config):
+        captura.append(config.temperature)
+        return SimpleNamespace(parsed=_cal(("Claridad", 5), ("Contenido", 8)))
+
+    monkeypatch.setattr(grader.client.models, "generate_content", fake_generate)
+
+    resps = [{"nombre": "Ana", "respuesta": "texto 1"}, {"nombre": "Bob", "respuesta": "texto 2"}]
+    res = grader.calificar_multipartida(RUBRICA, resps, indice_libertad=0.7)
+    assert len(res) == 2
+    assert res[0]["meta"]["indice_libertad"] == 0.7
+    assert res[1]["meta"]["indice_libertad"] == 0.7
+    assert captura == [0.7, 0.7]
 
 
 def test_calificar_reintenta_ante_429(monkeypatch, sin_espera):

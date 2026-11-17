@@ -569,7 +569,7 @@ with tab_masiva:
         "- Columna **estudiante** (o *nombre_estudiante*, *nombre*): nombre del estudiante.\n"
         "- Columna **respuesta**: texto de la respuesta.\n"
         "- Columna opcional **nota_humana**: nota que asignaste manualmente.\n\n"
-        "Puedes usar la rúbrica cargada arriba o la predeterminada."
+        "Puedes usar la rúbrica cargada en la pestaña \"Evaluar\" o la predeterminada."
     )
 
     # --- Configurar cantidad de intentos ---

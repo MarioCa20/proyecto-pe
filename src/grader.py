@@ -1,3 +1,4 @@
+import io
 import os, time, json
 from pathlib import Path
 from dotenv import load_dotenv
@@ -8,6 +9,61 @@ from google.genai import types, errors
 load_dotenv()
 MODELO = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")  # verifica el nombre vigente en AI Studio
 client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+
+def cargar_rubrica_excel(archivo) -> list[dict]:
+    """Lee un .xlsx y lo convierte a [{nombre, descripcion, max_puntos}, ...].
+
+    Formato esperado del xlsx:
+      Columna A:  nombre     (str)
+      Columna B:  descripcion (str)
+      Columna C:  max_puntos  (número)
+
+    La primera fila se usa como encabezados. Se omite cualquier fila vacía en
+    la columna 'nombre'.
+    """
+    import pandas as pd
+
+    df = pd.read_excel(archivo)
+
+    # Normalizar nombres de columnas (minúsculas, strip, asegurar str)
+    df.columns = df.columns.astype(str).str.strip().str.lower()
+
+    # Mapeo flexible de nombres de columna
+    col_map = {}
+    for col in df.columns:
+        if any(k in col for k in ("nombre", "criterio")):
+            col_map.setdefault("nombre", col)
+        if any(k in col for k in ("descrip", "desc", "detalle")):
+            col_map.setdefault("descripcion", col)
+        if any(k in col for k in ("punto", "max", "punt", "valor")):
+            col_map.setdefault("max_puntos", col)
+
+    # Fallback: si no se encontraron encabezados, usar posición (col A=nombre, B=desc, C=max)
+    if not col_map:
+        cols = df.columns.tolist()
+        if len(cols) >= 3:
+            col_map["nombre"] = cols[0]
+            col_map["descripcion"] = cols[1]
+            col_map["max_puntos"] = cols[2]
+        elif len(cols) == 2:
+            col_map["nombre"] = cols[0]
+            col_map["descripcion"] = ""
+            col_map["max_puntos"] = cols[1]
+
+    rubrica = []
+    for _, row in df.iterrows():
+        nombre = str(row[col_map["nombre"]]).strip() if col_map.get("nombre") else ""
+        if not nombre:
+            continue
+        rubrica.append({
+            "nombre": nombre,
+            "descripcion": str(row[col_map.get("descripcion", "")]).strip()
+                           if col_map.get("descripcion") else "",
+            "max_puntos": float(row[col_map["max_puntos"]]) if col_map.get("max_puntos")
+                          else 0,
+        })
+    return rubrica
 
 
 # --- Esquema de salida (Gemini lo fuerza a devolver JSON válido) ---

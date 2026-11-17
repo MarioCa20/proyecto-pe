@@ -18,7 +18,7 @@ load_dotenv()
 HAY_CLAVE_REAL = bool(os.getenv("GEMINI_API_KEY"))
 os.environ.setdefault("GEMINI_API_KEY", "clave-falsa-para-tests")  # grader la exige al importar
 
-import grader  # noqa: E402
+from src import grader # noqa: E402
 from google.genai import errors  # noqa: E402
 
 RUBRICA = [

@@ -299,6 +299,245 @@ def test_extraer_json_con_vallas_de_codigo():
 
 
 
+# ---------- llama.cpp (modelo local de Ángel): pruebas portadas + integración ----------
+
+_CADENA_REAL = grader._cadena      # la autouse de arriba la reemplaza; aquí guardamos la verdadera
+
+
+def _falso_llama(respuestas):
+    """Reemplaza _llamar_llama: cada elemento es texto crudo del modelo (JSON, con ```, etc.) o una excepción."""
+    estado = {"n": 0, "temps": [], "contenidos": []}
+
+    def fake(modelo, sistema, contenido, temp):
+        item = respuestas[min(estado["n"], len(respuestas) - 1)]
+        estado["n"] += 1
+        estado["temps"].append(temp)
+        estado["contenidos"].append(contenido)
+        if isinstance(item, Exception):
+            raise item
+        return grader._parsear(item)
+
+    fake.llamadas = estado
+    return fake
+
+
+def _solo_llama(monkeypatch, respuestas):
+    monkeypatch.setattr(grader, "_cadena", lambda: [("llama", grader.LLAMA_MODEL)])
+    fake = _falso_llama(respuestas)
+    monkeypatch.setattr(grader, "_llamar_llama", fake)
+    return fake
+
+
+def _json_cal(c, k, comentario="ok"):
+    return grader.json.dumps({"criterios": [
+        {"criterio": "Claridad", "puntaje": c, "justificacion": "j1"},
+        {"criterio": "Contenido", "puntaje": k, "justificacion": "j2"},
+    ], "comentario_general": comentario})
+
+
+def test_extraer_json_json_puro():
+    assert grader._extraer_json('{"a": 1}') == '{"a": 1}'
+
+
+def test_extraer_json_con_markdown_fences():
+    assert grader._extraer_json('```json\n{"a": 1}\n```') == '{"a": 1}'
+
+
+def test_extraer_json_con_texto_antes():
+    assert grader._extraer_json('Aquí está mi evaluación: {"a": 1}') == '{"a": 1}'
+
+
+def test_extraer_json_sin_json():
+    assert grader._extraer_json("El modelo no respondió con JSON") is None
+
+
+def test_llama_camino_feliz(monkeypatch, sin_espera):
+    fake = _solo_llama(monkeypatch, [_json_cal(4, 8)])
+
+    out = grader.calificar(RUBRICA, RESPUESTA)
+
+    assert out["total"] == 12
+    assert out["meta"]["proveedor"] == "llama"
+    assert out["meta"]["modelo"] == f"llama:{grader.LLAMA_MODEL}"
+    assert out["meta"]["api_url"] == grader.LLAMA_API_URL
+    assert out["meta"]["fallback"] is False
+    assert out["meta"]["indice_libertad"] == 0.0
+    assert fake.llamadas["n"] == 1
+
+
+def test_api_url_solo_aparece_con_llama(monkeypatch, sin_espera):
+    fake_g = _falso_generate([_cal(("Claridad", 4), ("Contenido", 8))])
+    monkeypatch.setattr(grader.client.models, "generate_content", fake_g)
+    assert "api_url" not in grader.calificar(RUBRICA, RESPUESTA)["meta"]
+
+
+def test_llama_con_indice_libertad(monkeypatch, sin_espera):
+    fake = _solo_llama(monkeypatch, [_json_cal(5, 9)])
+
+    out = grader.calificar(RUBRICA, RESPUESTA, indice_libertad=0.8)
+
+    assert out["meta"]["indice_libertad"] == 0.8
+    assert out["meta"]["temperatura"] == 0.8
+    assert "ÍNDICE DE LIBERTAD / PERMISIVIDAD: 0.8" in fake.llamadas["contenidos"][0]
+    assert fake.llamadas["temps"] == [0.8]
+
+
+def test_llama_alias_temperatura(monkeypatch, sin_espera):
+    fake = _solo_llama(monkeypatch, [_json_cal(4, 7)])
+
+    out = grader.calificar(RUBRICA, RESPUESTA, temperatura=0.6)
+
+    assert out["meta"]["indice_libertad"] == 0.6
+    assert fake.llamadas["temps"] == [0.6]
+
+
+def test_llama_multipartida_con_indice_libertad(monkeypatch, sin_espera):
+    fake = _solo_llama(monkeypatch, [_json_cal(5, 8)])
+    resps = [{"nombre": "Ana", "respuesta": "texto 1"}, {"nombre": "Bob", "respuesta": "texto 2"}]
+
+    res = grader.calificar_multipartida(RUBRICA, resps, indice_libertad=0.7)
+
+    assert len(res) == 2
+    assert res[0]["meta"]["indice_libertad"] == res[1]["meta"]["indice_libertad"] == 0.7
+    assert fake.llamadas["temps"] == [0.7, 0.7]
+
+
+def test_llama_reintenta_si_el_modelo_se_sale_de_la_rubrica(monkeypatch, sin_espera):
+    mala = grader.json.dumps({"criterios": [
+        {"criterio": "Claridad", "puntaje": 3, "justificacion": "j1"},
+        {"criterio": "Inventado", "puntaje": 2, "justificacion": "j2"},
+    ]})
+    fake = _solo_llama(monkeypatch, [mala, _json_cal(3, 6)])
+
+    out = grader.calificar(RUBRICA, RESPUESTA)
+
+    assert out["total"] == 9
+    assert fake.llamadas["n"] == 2
+
+
+def test_llama_falla_tras_agotar_reintentos(monkeypatch, sin_espera):
+    incompleta = grader.json.dumps({"criterios": [{"criterio": "Claridad", "puntaje": 3, "justificacion": "j"}],
+                                    "comentario_general": "incompleto"})   # falta "Contenido"
+    fake = _solo_llama(monkeypatch, [incompleta])
+
+    with pytest.raises(RuntimeError, match="Falló tras 3 intentos"):
+        grader.calificar(RUBRICA, RESPUESTA)
+    assert fake.llamadas["n"] == 3
+
+
+def test_llama_no_pierde_si_el_modelo_envuelve_el_json_en_markdown(monkeypatch, sin_espera):
+    texto = ('```json\n{"criterios": [{"criterio": "Claridad", "puntaje": 5, "justificacion": "perfecta"}, '
+             '{"criterio": "Contenido", "puntaje": 10, "justificacion": "completa"}], '
+             '"comentario_general": "Excelente"}\n```')
+    _solo_llama(monkeypatch, [texto])
+
+    out = grader.calificar(RUBRICA, RESPUESTA)
+
+    assert out["total"] == 15
+    assert out["criterios"][0]["justificacion"] == "perfecta"
+
+
+def test_llama_entra_en_la_cadena_con_sus_valores_por_defecto(monkeypatch):
+    """La configuración local de Ángel no exige variables nuevas: llama entra sola, al final."""
+    for v in ("GROQ_API_KEY", "OPENROUTER_API_KEY", "OLLAMA_MODEL", "LLM_FALLBACK_ORDER", "LLAMA_MODEL"):
+        monkeypatch.delenv(v, raising=False)
+    monkeypatch.setattr(grader, "client", None)
+    assert _CADENA_REAL() == [("llama", "gemma-4-E4B-it-Q4_K_M.gguf")]
+
+    monkeypatch.setattr(grader, "client", object())
+    monkeypatch.setenv("GROQ_API_KEY", "x")
+    monkeypatch.setenv("OLLAMA_MODEL", "qwen2.5:7b")
+    provs = [p for p, _ in _CADENA_REAL()]
+    assert provs[0] == "gemini" and provs[-3:] == ["groq", "ollama", "llama"]
+
+
+def test_modo_solo_local_respeta_el_orden(monkeypatch):
+    monkeypatch.setenv("OLLAMA_MODEL", "qwen2.5:7b")
+    monkeypatch.setenv("LLM_FALLBACK_ORDER", "ollama,llama")
+    assert [p for p, _ in _CADENA_REAL()] == ["ollama", "llama"]
+
+
+def test_importar_grader_sin_google_genai(monkeypatch, caplog):
+    """Sin google-genai el módulo se importa igual, avisa en el log y Gemini no entra en la cadena."""
+    import importlib.util, sys
+    monkeypatch.setitem(sys.modules, "google.genai", None)        # fuerza ImportError
+    monkeypatch.setitem(sys.modules, "google.genai.types", None)
+    monkeypatch.delattr(sys.modules["google"], "genai", raising=False)
+    monkeypatch.setenv("GEMINI_API_KEY", "clave-falsa")
+    monkeypatch.setenv("GROQ_API_KEY", "otra-clave-falsa")
+    monkeypatch.delenv("LLM_FALLBACK_ORDER", raising=False)
+
+    spec = importlib.util.spec_from_file_location("grader_sin_genai", grader.__file__)
+    mod = importlib.util.module_from_spec(spec)
+    with caplog.at_level("WARNING", logger="calificador"):
+        spec.loader.exec_module(mod)
+
+    assert "google-genai no está instalado: pip install -r requirements.txt" in caplog.text
+    assert mod.client is None
+    provs = [p for p, _ in mod._cadena()]
+    assert "gemini" not in provs and provs[0] == "groq"
+
+
+def test_cadena_completa_gemini_caido_groq_caido_llama_responde(monkeypatch, sin_espera):
+    monkeypatch.setattr(grader, "_cadena", lambda: [("gemini", "g"), ("groq", "l"), ("llama", grader.LLAMA_MODEL)])
+    caido = errors.APIError(503, {"error": {"message": "overloaded", "status": "UNAVAILABLE"}})
+    fake_g = _falso_generate([caido])
+    monkeypatch.setattr(grader.client.models, "generate_content", fake_g)
+    monkeypatch.setenv("GROQ_API_KEY", "clave-falsa")
+
+    def groq_caido(*a, **k):
+        raise grader.requests.HTTPError("503", response=SimpleNamespace(status_code=503))
+    monkeypatch.setattr(grader, "_llamar_openai_compat", groq_caido)
+    fake_l = _falso_llama([_json_cal(4, 8)])
+    monkeypatch.setattr(grader, "_llamar_llama", fake_l)
+
+    out = grader.calificar(RUBRICA, RESPUESTA)
+
+    assert out["total"] == 12
+    assert out["meta"]["proveedor"] == "llama"
+    assert out["meta"]["fallback"] is True
+    assert len(out["meta"]["fallos_previos"]) == 2
+    assert out["meta"]["fallos_previos"][0].startswith("gemini:") and out["meta"]["fallos_previos"][1].startswith("groq:")
+    assert out["meta"]["api_url"] == grader.LLAMA_API_URL
+    assert fake_l.llamadas["n"] == 1
+
+
+def _post_falso(capturas, texto):
+    def post(url, json=None, timeout=None, **kw):
+        capturas.update(url=url, payload=json, timeout=timeout)
+        return SimpleNamespace(raise_for_status=lambda: None,
+                               json=lambda: {"choices": [{"message": {"content": texto}}]})
+    return post
+
+
+def test_llama_usa_su_propio_timeout_y_el_formato_de_angel(monkeypatch):
+    cap = {}
+    monkeypatch.setattr(grader.requests, "post", _post_falso(cap, _json_cal(4, 8)))
+    monkeypatch.setenv("LLM_TIMEOUT", "5")                       # el global no debe afectar a llama
+    monkeypatch.delenv("LLAMA_TIMEOUT", raising=False)
+
+    cal = grader._llamar_llama("m.gguf", "sistema", "contenido", 0.3)
+
+    assert cap["timeout"] == 300.0 == grader.LLAMA_TIMEOUT
+    assert cap["url"] == grader.LLAMA_API_URL
+    p = cap["payload"]
+    assert p["max_tokens"] == 4096 and p["stream"] is False and p["temperature"] == 0.3
+    assert p["response_format"]["type"] == "json_schema"
+    assert p["response_format"]["schema"]["required"] == ["criterios", "comentario_general"]
+    assert [m["role"] for m in p["messages"]] == ["system", "user"]
+    assert cal.criterios[1].puntaje == 8
+
+    monkeypatch.setenv("LLAMA_TIMEOUT", "42")
+    grader._llamar_llama("m.gguf", "s", "c", 0.0)
+    assert cap["timeout"] == 42.0
+
+
+def test_timeout_de_llama_se_reintenta_y_luego_se_informa(monkeypatch, sin_espera):
+    _solo_llama(monkeypatch, [grader.requests.Timeout("lento")])
+    with pytest.raises(RuntimeError, match="Falló tras 3 intentos"):
+        grader.calificar(RUBRICA, RESPUESTA)
+
+
 # ---------- pruebas en vivo (gastan cuota; solo con -m live) ----------
 
 live = pytest.mark.skipif(not HAY_CLAVE_REAL, reason="No hay GEMINI_API_KEY en .env")
@@ -468,3 +707,14 @@ def test_cargar_rubrica_excel_criterios_json_sheet(tmp_path):
     assert result[0]["nombre"] == "Análisis"
     assert result[0]["max_puntos"] == 15
     assert result[0]["escalas"] == []
+
+
+# ---------- pruebas en vivo de llama.cpp (portadas de Ángel; requieren llama-server corriendo) ----------
+
+@pytest.mark.live
+def test_live_llama_conexion_y_formato(monkeypatch):
+    monkeypatch.setattr(grader, "_cadena", lambda: [("llama", grader.LLAMA_MODEL)])
+    out = grader.calificar(RUBRICA, RESPUESTA)
+    assert 0 <= out["total"] <= out["total_max"] == 15
+    assert len(out["criterios"]) == 2
+    assert out["meta"]["proveedor"] == "llama"

@@ -4,22 +4,38 @@ from pathlib import Path
 from datetime import datetime
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
-from google import genai
-from google.genai import types, errors
 import pandas as pd
 import requests
 
 load_dotenv()
 log = logging.getLogger("calificador")
 
+# Importación defensiva: si google-genai no está instalado, Gemini simplemente no entra en la cadena
+try:
+    from google import genai
+    from google.genai import types, errors
+except ImportError:                                          # pragma: no cover (se prueba con monkeypatch)
+    genai = types = None
+    log.warning("google-genai no está instalado: pip install -r requirements.txt "
+                "(Gemini quedará fuera de la cadena de proveedores)")
+
+    class errors:                                            # noqa: N801 - marcador para los 'except'
+        class APIError(Exception):
+            code = 0
+
 MODELO = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")  # verifica el nombre vigente en AI Studio
 TIMEOUT_S = float(os.getenv("LLM_TIMEOUT", "30"))            # si un proveedor no responde, pasamos al siguiente
 COOLDOWN_S = float(os.getenv("LLM_COOLDOWN", "60"))          # tiempo que se "descansa" un proveedor caído
 
+# llama.cpp (llama-server) con gemma 4: valores por defecto de la configuración local de Ángel
+LLAMA_API_URL = os.getenv("LLAMA_API_URL", "http://127.0.0.1:8080/v1/chat/completions")
+LLAMA_MODEL = os.getenv("LLAMA_MODEL", "gemma-4-E4B-it-Q4_K_M.gguf")
+LLAMA_TIMEOUT = float(os.getenv("LLAMA_TIMEOUT", "300"))     # el modelo local es lento: timeout propio
+
 _GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 client = (
     genai.Client(api_key=_GEMINI_KEY, http_options=types.HttpOptions(timeout=int(TIMEOUT_S * 1000)))
-    if _GEMINI_KEY else None
+    if (_GEMINI_KEY and genai is not None) else None
 )
 
 # Códigos HTTP que justifican reintentar (cuota o servidor saturado)
@@ -195,7 +211,7 @@ def _validar(cal: Calificacion, rubrica: list[dict]) -> dict:
 
 # ---------------------------------------------------------------------------
 # Proveedores de LLM con respaldo (fallback)
-#   Orden por defecto: gemini -> groq -> openrouter -> ollama (local)
+#   Orden por defecto: gemini -> groq -> openrouter -> ollama (local) -> llama (llama.cpp, local)
 #   Un proveedor solo entra en la cadena si está configurado en el .env.
 # ---------------------------------------------------------------------------
 class _FalloSimulado(Exception):
@@ -205,7 +221,7 @@ class _FalloSimulado(Exception):
 def _cadena() -> list[tuple[str, str]]:
     """Lista ordenada de (proveedor, modelo) disponibles según las variables de entorno."""
     orden = [p.strip().lower() for p in os.getenv(
-        "LLM_FALLBACK_ORDER", "gemini,groq,openrouter,ollama").split(",") if p.strip()]
+        "LLM_FALLBACK_ORDER", "gemini,groq,openrouter,ollama,llama").split(",") if p.strip()]
     cadena: list[tuple[str, str]] = []
     for prov in orden:
         if prov == "gemini" and client is not None:
@@ -219,18 +235,72 @@ def _cadena() -> list[tuple[str, str]]:
             cadena.append(("openrouter", os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free")))
         elif prov == "ollama" and os.getenv("OLLAMA_MODEL"):
             cadena.append(("ollama", os.getenv("OLLAMA_MODEL")))
+        elif prov == "llama":                       # configuración local de Ángel: entra con sus valores por defecto
+            cadena.append(("llama", os.getenv("LLAMA_MODEL", LLAMA_MODEL)))
     if not cadena:
         raise RuntimeError(
             "No hay ningún proveedor de IA configurado. Define GEMINI_API_KEY, GROQ_API_KEY, "
-            "OPENROUTER_API_KEY u OLLAMA_MODEL en el archivo .env."
+            "OPENROUTER_API_KEY, OLLAMA_MODEL o LLAMA_MODEL en el archivo .env."
         )
     return cadena
 
 
-def _extraer_json(texto: str) -> str:
-    """Los modelos open-source a veces envuelven el JSON en ```json ... ```; nos quedamos con el objeto."""
-    m = re.search(r"\{.*\}", texto, re.S)
-    return m.group(0) if m else texto.strip()
+def _extraer_json(texto: str) -> str | None:
+    """Extrae un bloque JSON válido del texto de un modelo (la usan todos los proveedores).
+
+    El modelo puede responder JSON puro, JSON dentro de ```json ... ``` / ``` ... ```,
+    o texto libre seguido de un JSON. Devuelve el texto del JSON, o None si no hay ninguno válido.
+    """
+    # 1. Bloque ```json ... ``` o ``` ... ```
+    bloque = re.search(r'```(?:json)?\s*\n(.*?)\n```', texto, re.DOTALL)
+    if bloque:
+        return bloque.group(1).strip()
+
+    # 2. Primer { ... } que sea JSON válido (probando cierres de más largo a más corto)
+    inicio = texto.find('{')
+    if inicio == -1:
+        return None
+    for fin in range(texto.rfind('}'), inicio - 1, -1):
+        candidato = texto[inicio:fin + 1]
+        try:
+            json.loads(candidato)
+            return candidato
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def _parsear(texto: str) -> "Calificacion":
+    """Texto crudo del modelo -> Calificacion. ValueError si no hay JSON utilizable (se reintenta)."""
+    j = _extraer_json(texto)
+    if j is None:
+        raise ValueError(f"No se pudo extraer JSON de la respuesta del modelo. Texto: {texto[:300]}")
+    return Calificacion.model_validate(json.loads(j))
+
+
+def _obtener_esquema_calificacion() -> dict:
+    """Esquema JSON de la salida (el mismo que usa llama.cpp en response_format)."""
+    return {
+        "type": "object",
+        "properties": {
+            "criterios": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "criterio": {"type": "string"},
+                        "puntaje": {"type": "number"},
+                        "justificacion": {"type": "string"}
+                    },
+                    "required": ["criterio", "puntaje", "justificacion"],
+                    "additionalProperties": False
+                }
+            },
+            "comentario_general": {"type": "string"}
+        },
+        "required": ["criterios", "comentario_general"],
+        "additionalProperties": False
+    }
 
 
 def _mensajes(sistema: str, contenido: str) -> list[dict]:
@@ -265,7 +335,7 @@ def _llamar_openai_compat(url, api_key, modelo, sistema, contenido, temp, extra_
     r = requests.post(url, headers=headers, json=body, timeout=TIMEOUT_S)
     r.raise_for_status()
     texto = r.json()["choices"][0]["message"]["content"]
-    return Calificacion.model_validate_json(_extraer_json(texto))
+    return _parsear(texto)
 
 
 def _llamar_ollama(modelo, sistema, contenido, temp) -> "Calificacion":
@@ -281,7 +351,32 @@ def _llamar_ollama(modelo, sistema, contenido, temp) -> "Calificacion":
     r = requests.post(f"{host}/api/chat", json=body,
                       timeout=float(os.getenv("OLLAMA_TIMEOUT", "120")))  # el modelo local es más lento
     r.raise_for_status()
-    return Calificacion.model_validate_json(_extraer_json(r.json()["message"]["content"]))
+    return _parsear(r.json()["message"]["content"])
+
+
+def _llamar_llama(modelo, sistema, contenido, temp) -> "Calificacion":
+    """llama.cpp (llama-server, endpoint /v1/chat/completions compatible con OpenAI). Modelo local de Ángel."""
+    url = os.getenv("LLAMA_API_URL", LLAMA_API_URL)
+    payload = {
+        "model": modelo,
+        "messages": [
+            {"role": "system", "content": sistema},
+            {"role": "user", "content": contenido},
+        ],
+        "temperature": temp,
+        "max_tokens": 4096,
+        "stream": False,
+        "response_format": {"type": "json_schema", "schema": _obtener_esquema_calificacion()},
+    }
+    r = requests.post(url, json=payload, timeout=float(os.getenv("LLAMA_TIMEOUT", LLAMA_TIMEOUT)))
+    r.raise_for_status()
+    data = r.json()
+    if not data.get("choices"):
+        raise ValueError("La respuesta no contiene 'choices': " + str(data)[:500])
+    texto = data["choices"][0]["message"]["content"]
+    if not texto:
+        raise ValueError("La respuesta está vacía")
+    return _parsear(texto)
 
 
 def _llamar(prov, modelo, sistema, contenido, temp) -> "Calificacion":
@@ -298,6 +393,8 @@ def _llamar(prov, modelo, sistema, contenido, temp) -> "Calificacion":
                                      {"X-Title": "Calificador Automatico PE"})
     if prov == "ollama":
         return _llamar_ollama(modelo, sistema, contenido, temp)
+    if prov == "llama":
+        return _llamar_llama(modelo, sistema, contenido, temp)
     raise ValueError(f"Proveedor desconocido: {prov}")
 
 
@@ -355,6 +452,8 @@ def calificar(rubrica: list[dict], respuesta: str,
                     "temperatura": indice_libertad,
                     "segundos": round(time.time() - t0, 2),
                 }
+                if prov == "llama":
+                    salida["meta"]["api_url"] = os.getenv("LLAMA_API_URL", LLAMA_API_URL)
                 if fallos:
                     log.warning("Se usó %s:%s tras fallar: %s", prov, modelo, "; ".join(fallos))
                 return salida

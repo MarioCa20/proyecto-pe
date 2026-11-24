@@ -64,6 +64,14 @@ def test_validar_rechaza_criterios_faltantes():
 
 # ---------- calificar (con el cliente de Gemini simulado) ----------
 
+@pytest.fixture(autouse=True)
+def solo_gemini(monkeypatch):
+    """Por defecto las pruebas usan solo Gemini (simulado), aunque el .env tenga otras claves."""
+    monkeypatch.setattr(grader, "_cadena", lambda: [("gemini", grader.MODELO)])
+    grader._caidos.clear()
+    monkeypatch.delenv("SIMULAR_FALLO", raising=False)
+
+
 @pytest.fixture
 def sin_espera(monkeypatch):
     """Evita dormir de verdad en los reintentos y no depende de prompts/v1.md."""
@@ -187,6 +195,108 @@ def test_calificar_falla_tras_agotar_reintentos(monkeypatch, sin_espera):
     with pytest.raises(RuntimeError, match="Falló tras 3 intentos"):
         grader.calificar(RUBRICA, RESPUESTA)
     assert fake.llamadas["n"] == 3
+
+
+# ---------- fallback entre proveedores ----------
+
+def _con_respaldo(monkeypatch, respuestas_gemini, respuestas_groq):
+    """Cadena gemini -> groq con ambos proveedores simulados."""
+    monkeypatch.setattr(grader, "_cadena", lambda: [("gemini", "g-modelo"), ("groq", "l-modelo")])
+    fake_g = _falso_generate(respuestas_gemini)
+    monkeypatch.setattr(grader.client.models, "generate_content", fake_g)
+    llamadas_groq = {"n": 0}
+
+    def fake_groq(modelo, sistema, contenido, temp):
+        llamadas_groq["n"] += 1
+        item = respuestas_groq[min(llamadas_groq["n"] - 1, len(respuestas_groq) - 1)]
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    monkeypatch.setattr(grader, "_llamar_openai_compat",
+                        lambda url, key, modelo, sistema, contenido, temp, h=None: fake_groq(modelo, sistema, contenido, temp))
+    monkeypatch.setenv("GROQ_API_KEY", "clave-falsa")
+    return fake_g, llamadas_groq
+
+
+def test_fallback_cuando_gemini_cae(monkeypatch, sin_espera):
+    caido = errors.APIError(503, {"error": {"message": "overloaded", "status": "UNAVAILABLE"}})
+    fake_g, llamadas_groq = _con_respaldo(monkeypatch, [caido], [_cal(("Claridad", 5), ("Contenido", 10))])
+
+    out = grader.calificar(RUBRICA, RESPUESTA)
+
+    assert out["total"] == 15
+    assert out["meta"]["proveedor"] == "groq"
+    assert out["meta"]["fallback"] is True
+    assert out["meta"]["modelo"] == "groq:l-modelo"
+    assert fake_g.llamadas["n"] == 2          # con respaldo solo insiste 2 veces en el principal
+    assert llamadas_groq["n"] == 1
+
+
+def test_fallback_ante_clave_invalida_de_gemini(monkeypatch, sin_espera):
+    auth = errors.APIError(403, {"error": {"message": "clave", "status": "PERMISSION_DENIED"}})
+    fake_g, _ = _con_respaldo(monkeypatch, [auth], [_cal(("Claridad", 5), ("Contenido", 10))])
+
+    out = grader.calificar(RUBRICA, RESPUESTA)
+
+    assert out["meta"]["proveedor"] == "groq"
+    assert fake_g.llamadas["n"] == 1          # 403: no se reintenta, se pasa directo al respaldo
+
+
+def test_gemini_en_pausa_se_salta_en_la_siguiente_llamada(monkeypatch, sin_espera):
+    caido = errors.APIError(503, {"error": {"message": "overloaded", "status": "UNAVAILABLE"}})
+    fake_g, llamadas_groq = _con_respaldo(monkeypatch, [caido], [_cal(("Claridad", 5), ("Contenido", 10))])
+
+    grader.calificar(RUBRICA, RESPUESTA)
+    n_gemini = fake_g.llamadas["n"]
+    out = grader.calificar(RUBRICA, RESPUESTA)
+
+    assert fake_g.llamadas["n"] == n_gemini    # no volvió a golpear a Gemini
+    assert out["meta"]["proveedor"] == "groq"
+
+
+def test_fallo_de_todos_los_proveedores(monkeypatch, sin_espera):
+    caido = errors.APIError(503, {"error": {"message": "overloaded", "status": "UNAVAILABLE"}})
+    _con_respaldo(monkeypatch, [caido], [grader.requests.ConnectionError("sin red")])
+
+    with pytest.raises(RuntimeError, match="Proveedores probados"):
+        grader.calificar(RUBRICA, RESPUESTA)
+
+
+def test_simular_fallo_fuerza_el_respaldo(monkeypatch, sin_espera):
+    fake_g, llamadas_groq = _con_respaldo(monkeypatch, [_cal(("Claridad", 5), ("Contenido", 10))],
+                                          [_cal(("Claridad", 4), ("Contenido", 8))])
+    monkeypatch.setenv("SIMULAR_FALLO", "gemini")
+
+    out = grader.calificar(RUBRICA, RESPUESTA)
+
+    assert out["total"] == 12
+    assert fake_g.llamadas["n"] == 0          # Gemini ni se llamó
+    assert out["meta"]["fallback"] is True
+
+
+def test_timeout_de_red_de_gemini_cae_al_respaldo(monkeypatch, sin_espera):
+    ReadTimeout = type("ReadTimeout", (Exception,), {"__module__": "httpx"})   # como el de httpx
+    fake_g, llamadas_groq = _con_respaldo(monkeypatch, [ReadTimeout("timeout")],
+                                          [_cal(("Claridad", 5), ("Contenido", 10))])
+
+    out = grader.calificar(RUBRICA, RESPUESTA)
+
+    assert out["meta"]["proveedor"] == "groq"
+    assert fake_g.llamadas["n"] == 2          # un timeout se reintenta antes de rendirse
+
+
+def test_un_bug_real_no_se_disfraza_de_fallo_de_proveedor(monkeypatch, sin_espera):
+    fake_g, _ = _con_respaldo(monkeypatch, [KeyError("bug")], [_cal(("Claridad", 5), ("Contenido", 10))])
+
+    with pytest.raises(KeyError):
+        grader.calificar(RUBRICA, RESPUESTA)
+
+
+def test_extraer_json_con_vallas_de_codigo():
+    texto = 'Claro:\n```json\n{"criterios": [], "comentario_general": "x"}\n```'
+    assert grader._extraer_json(texto) == '{"criterios": [], "comentario_general": "x"}'
+
 
 
 # ---------- pruebas en vivo (gastan cuota; solo con -m live) ----------

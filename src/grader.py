@@ -1,5 +1,5 @@
 import io
-import os, time, json
+import os, time, json, re, logging
 from pathlib import Path
 from datetime import datetime
 from dotenv import load_dotenv
@@ -7,10 +7,26 @@ from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types, errors
 import pandas as pd
+import requests
 
 load_dotenv()
+log = logging.getLogger("calificador")
+
 MODELO = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")  # verifica el nombre vigente en AI Studio
-client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+TIMEOUT_S = float(os.getenv("LLM_TIMEOUT", "30"))            # si un proveedor no responde, pasamos al siguiente
+COOLDOWN_S = float(os.getenv("LLM_COOLDOWN", "60"))          # tiempo que se "descansa" un proveedor caído
+
+_GEMINI_KEY = os.getenv("GEMINI_API_KEY")
+client = (
+    genai.Client(api_key=_GEMINI_KEY, http_options=types.HttpOptions(timeout=int(TIMEOUT_S * 1000)))
+    if _GEMINI_KEY else None
+)
+
+# Códigos HTTP que justifican reintentar (cuota o servidor saturado)
+_TRANSITORIOS = (429, 500, 502, 503, 504)
+
+# (proveedor, modelo) -> instante en que se marcó como caído (circuit breaker)
+_caidos: dict[tuple[str, str], float] = {}
 
 
 def _remover_acentos(texto: str) -> str:
@@ -177,6 +193,114 @@ def _validar(cal: Calificacion, rubrica: list[dict]) -> dict:
             "comentario_general": cal.comentario_general}
 
 
+# ---------------------------------------------------------------------------
+# Proveedores de LLM con respaldo (fallback)
+#   Orden por defecto: gemini -> groq -> openrouter -> ollama (local)
+#   Un proveedor solo entra en la cadena si está configurado en el .env.
+# ---------------------------------------------------------------------------
+class _FalloSimulado(Exception):
+    """Se lanza cuando el proveedor está en SIMULAR_FALLO (para la demo)."""
+
+
+def _cadena() -> list[tuple[str, str]]:
+    """Lista ordenada de (proveedor, modelo) disponibles según las variables de entorno."""
+    orden = [p.strip().lower() for p in os.getenv(
+        "LLM_FALLBACK_ORDER", "gemini,groq,openrouter,ollama").split(",") if p.strip()]
+    cadena: list[tuple[str, str]] = []
+    for prov in orden:
+        if prov == "gemini" and client is not None:
+            cadena.append(("gemini", MODELO))
+            for extra in os.getenv("GEMINI_FALLBACK_MODELS", "").split(","):
+                if extra.strip():
+                    cadena.append(("gemini", extra.strip()))
+        elif prov == "groq" and os.getenv("GROQ_API_KEY"):
+            cadena.append(("groq", os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")))
+        elif prov == "openrouter" and os.getenv("OPENROUTER_API_KEY"):
+            cadena.append(("openrouter", os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free")))
+        elif prov == "ollama" and os.getenv("OLLAMA_MODEL"):
+            cadena.append(("ollama", os.getenv("OLLAMA_MODEL")))
+    if not cadena:
+        raise RuntimeError(
+            "No hay ningún proveedor de IA configurado. Define GEMINI_API_KEY, GROQ_API_KEY, "
+            "OPENROUTER_API_KEY u OLLAMA_MODEL en el archivo .env."
+        )
+    return cadena
+
+
+def _extraer_json(texto: str) -> str:
+    """Los modelos open-source a veces envuelven el JSON en ```json ... ```; nos quedamos con el objeto."""
+    m = re.search(r"\{.*\}", texto, re.S)
+    return m.group(0) if m else texto.strip()
+
+
+def _mensajes(sistema: str, contenido: str) -> list[dict]:
+    esquema = json.dumps(Calificacion.model_json_schema(), ensure_ascii=False)
+    return [
+        {"role": "system", "content": f"{sistema}\n\nResponde ÚNICAMENTE con un objeto JSON válido "
+                                      f"que cumpla este esquema:\n{esquema}"},
+        {"role": "user", "content": contenido},
+    ]
+
+
+def _llamar_gemini(modelo, sistema, contenido, temp) -> "Calificacion":
+    config = types.GenerateContentConfig(
+        system_instruction=sistema,
+        temperature=temp,
+        response_mime_type="application/json",
+        response_schema=Calificacion,
+    )
+    r = client.models.generate_content(model=modelo, contents=contenido, config=config)
+    return r.parsed
+
+
+def _llamar_openai_compat(url, api_key, modelo, sistema, contenido, temp, extra_headers=None) -> "Calificacion":
+    """Groq y OpenRouter hablan el mismo protocolo (chat/completions de OpenAI)."""
+    headers = {"Authorization": f"Bearer {api_key}", **(extra_headers or {})}
+    body = {
+        "model": modelo,
+        "temperature": temp,
+        "response_format": {"type": "json_object"},
+        "messages": _mensajes(sistema, contenido),
+    }
+    r = requests.post(url, headers=headers, json=body, timeout=TIMEOUT_S)
+    r.raise_for_status()
+    texto = r.json()["choices"][0]["message"]["content"]
+    return Calificacion.model_validate_json(_extraer_json(texto))
+
+
+def _llamar_ollama(modelo, sistema, contenido, temp) -> "Calificacion":
+    """Modelo local (Ollama). Corre en tu equipo: sin internet, sin cuota, sin API key."""
+    host = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+    body = {
+        "model": modelo,
+        "stream": False,
+        "format": Calificacion.model_json_schema(),   # salida estructurada
+        "options": {"temperature": temp},
+        "messages": _mensajes(sistema, contenido),
+    }
+    r = requests.post(f"{host}/api/chat", json=body,
+                      timeout=float(os.getenv("OLLAMA_TIMEOUT", "120")))  # el modelo local es más lento
+    r.raise_for_status()
+    return Calificacion.model_validate_json(_extraer_json(r.json()["message"]["content"]))
+
+
+def _llamar(prov, modelo, sistema, contenido, temp) -> "Calificacion":
+    if prov in {p.strip().lower() for p in os.getenv("SIMULAR_FALLO", "").split(",") if p.strip()}:
+        raise _FalloSimulado(f"{prov} simulado como caído (SIMULAR_FALLO)")
+    if prov == "gemini":
+        return _llamar_gemini(modelo, sistema, contenido, temp)
+    if prov == "groq":
+        return _llamar_openai_compat("https://api.groq.com/openai/v1/chat/completions",
+                                     os.environ["GROQ_API_KEY"], modelo, sistema, contenido, temp)
+    if prov == "openrouter":
+        return _llamar_openai_compat("https://openrouter.ai/api/v1/chat/completions",
+                                     os.environ["OPENROUTER_API_KEY"], modelo, sistema, contenido, temp,
+                                     {"X-Title": "Calificador Automatico PE"})
+    if prov == "ollama":
+        return _llamar_ollama(modelo, sistema, contenido, temp)
+    raise ValueError(f"Proveedor desconocido: {prov}")
+
+
 def calificar(rubrica: list[dict], respuesta: str,
               version_prompt: str = "v1", indice_libertad: float = 0.0,
               temperatura: float | None = None,
@@ -200,37 +324,79 @@ def calificar(rubrica: list[dict], respuesta: str,
         f"RESPUESTA DEL ESTUDIANTE:\n<<<\n{respuesta}\n>>>"
     )
 
-    config = types.GenerateContentConfig(
-        system_instruction=sistema,
-        temperature=indice_libertad,
-        response_mime_type="application/json",
-        response_schema=Calificacion,
-    )
-
+    cadena = _cadena()
+    fallos: list[str] = []          # bitácora de por qué se descartó cada proveedor
     ultimo_error = None
-    for intento in range(reintentos):
-        try:
-            t0 = time.time()
-            r = client.models.generate_content(model=MODELO, contents=contenido, config=config)
-            salida = _validar(r.parsed, rubrica)
-            salida["meta"] = {
-                "modelo": MODELO,
-                "prompt": version_prompt,
-                "indice_libertad": indice_libertad,
-                "temperatura": indice_libertad,
-                "segundos": round(time.time() - t0, 2),
-            }
-            return salida
-        except errors.APIError as e:
-            ultimo_error = e
-            if e.code in (429, 500, 503):          # cuota o servidor saturado
-                time.sleep(2 ** intento)           # backoff: 1s, 2s, 4s
-                continue
-            raise                                  # 400/401/403: no tiene sentido reintentar
-        except (ValueError, TypeError) as e:       # JSON inválido o fuera de rúbrica
-            ultimo_error = e
+    intentos = 0
+
+    for pos, (prov, modelo) in enumerate(cadena):
+        es_ultimo = pos == len(cadena) - 1
+        # Si ya lo marcamos como caído hace poco, no perdemos tiempo (salvo que sea la última opción)
+        if not es_ultimo and time.time() - _caidos.get((prov, modelo), 0) < COOLDOWN_S:
+            fallos.append(f"{prov}:{modelo} (en pausa)")
             continue
-    raise RuntimeError(f"Falló tras {reintentos} intentos: {ultimo_error}")
+        max_int = reintentos if es_ultimo else min(reintentos, 2)   # con respaldo, no insistas tanto
+
+        for intento in range(max_int):
+            intentos += 1
+            transitorio = False
+            try:
+                t0 = time.time()
+                cal = _llamar(prov, modelo, sistema, contenido, indice_libertad)
+                salida = _validar(cal, rubrica)
+                _caidos.pop((prov, modelo), None)
+                salida["meta"] = {
+                    "modelo": modelo if prov == "gemini" else f"{prov}:{modelo}",
+                    "proveedor": prov,
+                    "fallback": pos > 0,
+                    "fallos_previos": fallos,
+                    "prompt": version_prompt,
+                    "indice_libertad": indice_libertad,
+                    "temperatura": indice_libertad,
+                    "segundos": round(time.time() - t0, 2),
+                }
+                if fallos:
+                    log.warning("Se usó %s:%s tras fallar: %s", prov, modelo, "; ".join(fallos))
+                return salida
+            except _FalloSimulado as e:
+                ultimo_error, fatal = e, True
+            except errors.APIError as e:               # Gemini
+                ultimo_error = e
+                transitorio = e.code in _TRANSITORIOS
+                fatal = not transitorio                # 400/401/403: reintentar no sirve
+            except requests.ConnectionError as e:      # servicio apagado / sin internet
+                ultimo_error, fatal = e, True
+            except requests.Timeout as e:
+                ultimo_error, transitorio, fatal = e, True, False
+            except requests.HTTPError as e:            # Groq / OpenRouter / Ollama
+                ultimo_error = e
+                codigo = e.response.status_code if e.response is not None else 0
+                transitorio = codigo in _TRANSITORIOS
+                fatal = not transitorio
+            except (ValueError, TypeError) as e:       # JSON inválido o fuera de rúbrica
+                ultimo_error = e
+                continue
+            except Exception as e:                     # red del SDK de Gemini (httpx): timeout, conexión
+                if type(e).__module__.split(".")[0] not in ("httpx", "httpcore", "httpx2", "httpcore2"):
+                    raise                              # un bug real no se disfraza de "proveedor caído"
+                ultimo_error = e
+                transitorio = "Timeout" in type(e).__name__
+                fatal = not transitorio
+
+            if fatal:
+                break
+            if intento < max_int - 1:                  # backoff solo si vamos a reintentar el mismo
+                time.sleep(2 ** intento)
+
+        if ultimo_error is not None:
+            fallos.append(f"{prov}:{modelo} ({type(ultimo_error).__name__})")
+            if not isinstance(ultimo_error, (ValueError, TypeError)):
+                _caidos[(prov, modelo)] = time.time()
+            if len(cadena) == 1 and isinstance(ultimo_error, errors.APIError) and ultimo_error.code not in _TRANSITORIOS:
+                raise ultimo_error                     # sin respaldo: 401/403 se muestran tal cual
+
+    detalle = "" if len(cadena) == 1 else f" | Proveedores probados: {', '.join(fallos)}"
+    raise RuntimeError(f"Falló tras {intentos} intentos: {ultimo_error}{detalle}")
 
 
 def cargar_respuestas_excel(archivo) -> list[dict]:

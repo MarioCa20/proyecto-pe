@@ -24,10 +24,11 @@ st.set_page_config(
 # ---------------------------------------------------------------------------
 # Clave API
 # ---------------------------------------------------------------------------
-if not os.getenv("GEMINI_API_KEY"):
+if not any(os.getenv(v) for v in ("GEMINI_API_KEY", "GROQ_API_KEY", "OPENROUTER_API_KEY", "OLLAMA_MODEL")):
     st.error(
-        "Falta `GEMINI_API_KEY`. Crea un archivo `.env` en la raíz del proyecto "
-        "(copia `.env.example`) y agrega tu clave: `GEMINI_API_KEY=tu_clave_aqui`."
+        "No hay ningún proveedor de IA configurado. Crea un archivo `.env` en la raíz del proyecto "
+        "(copia `.env.example`) y agrega al menos `GEMINI_API_KEY`, `GROQ_API_KEY`, "
+        "`OPENROUTER_API_KEY` u `OLLAMA_MODEL`."
     )
     st.stop()
 
@@ -538,6 +539,11 @@ with tab_evaluar:
             f"Índice de libertad: `{libertad_meta}` • "
             f"Tiempo: `{meta.get('segundos', '?')}s`"
         )
+        if meta.get("fallback"):
+            st.warning(
+                f"⚠️ El modelo principal no respondió; esta calificación la hizo el respaldo "
+                f"`{meta.get('modelo')}`. Descartados: {', '.join(meta.get('fallos_previos', []))}"
+            )
 
         col_export, col_colap = st.columns([1, 2])
         with col_export:

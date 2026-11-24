@@ -38,12 +38,40 @@ Copia el archivo de ejemplo y agrega tu clave:
 cp .env.example .env
 ```
 
-| Variable         | Obligatoria | Descripción                                              |
-| ---------------- | ----------- | -------------------------------------------------------- |
-| `GEMINI_API_KEY` | Sí          | Clave de la API de Gemini.                               |
-| `GEMINI_MODEL`   | No          | Modelo a usar (por defecto `gemini-3.5-flash-lite`).     |
+| Variable                 | Obligatoria | Descripción                                                              |
+| ------------------------ | ----------- | ------------------------------------------------------------------------ |
+| `GEMINI_API_KEY`         | Una de las 4 | Clave de Gemini (principal).                                            |
+| `GEMINI_MODEL`           | No          | Modelo principal (por defecto `gemini-3.5-flash-lite`). |
+| `GEMINI_FALLBACK_MODELS` | No          | Otros modelos de Gemini, separados por coma.                            |
+| `GROQ_API_KEY`           | Una de las 4 | Clave de Groq (respaldo gratis).                                        |
+| `GROQ_MODEL`             | No          | Por defecto `openai/gpt-oss-120b`.                                      |
+| `OPENROUTER_API_KEY`     | Una de las 4 | Clave de OpenRouter (respaldo opcional).                                |
+| `OLLAMA_MODEL`           | Una de las 4 | Modelo local de Ollama, p. ej. `qwen2.5:7b`.                            |
+
+Basta con configurar **al menos uno** de los cuatro proveedores; la guía completa de claves y modelos está en `.env.example`. Los nombres de modelo cambian con frecuencia: si un proveedor devuelve 404, revisa el nombre vigente en su consola y ajústalo en el `.env`.
 
 > Nunca subas tu archivo `.env` al repositorio (ya está en `.gitignore`).
+
+## Modelos de respaldo (fallback)
+
+Si Gemini falla (cuota, caída, timeout o clave inválida), el calificador pasa automáticamente al siguiente proveedor configurado. Orden por defecto: **Gemini → Groq → OpenRouter → Ollama (local)**. Solo entran los que tengan clave (o `OLLAMA_MODEL`) en el `.env`; en cada resultado se indica qué modelo calificó.
+
+| Proveedor  | Variable           | Costo / notas                                                         |
+| ---------- | ------------------ | --------------------------------------------------------------------- |
+| Groq       | `GROQ_API_KEY`     | Plan gratis con límites; muy rápido.                                  |
+| OpenRouter | `OPENROUTER_API_KEY` | Modelos con sufijo `:free`.                                         |
+| Ollama     | `OLLAMA_MODEL`     | Local, sin internet ni cuota (ver pasos abajo). |
+
+**Configuración paso a paso para el equipo**
+
+1. `cp .env.example .env`
+2. Crea tu clave de Gemini en <https://aistudio.google.com/apikey> y pégala en `GEMINI_API_KEY`.
+3. Crea tu clave gratis de Groq en <https://console.groq.com/keys> y pégala en `GROQ_API_KEY`.
+4. (Recomendado para la demo) Instala Ollama para tener un respaldo local sin internet:
+   `brew install ollama` (Mac; en Windows/Linux usa el instalador de <https://ollama.com>), luego `ollama pull qwen2.5:7b`, deja Ollama abierto y descomenta `OLLAMA_MODEL=qwen2.5:7b` en tu `.env`.
+5. Ejecuta `pytest` y después `streamlit run app.py`.
+
+Para ensayar la demo sin esperar una caída real: `SIMULAR_FALLO=gemini streamlit run app.py`.
 
 ## Uso
 

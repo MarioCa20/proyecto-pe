@@ -3,5 +3,5 @@ venv/
 setup.cfg
 .pytest_cache/
 __pycache__/
-
+.env.backup
 .DS_Store

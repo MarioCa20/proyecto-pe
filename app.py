@@ -22,14 +22,10 @@ st.set_page_config(
 )
 
 # ---------------------------------------------------------------------------
-# Clave API
+# URL del servidor local (llama.cpp)
 # ---------------------------------------------------------------------------
-if not os.getenv("GEMINI_API_KEY"):
-    st.error(
-        "Falta `GEMINI_API_KEY`. Crea un archivo `.env` en la raíz del proyecto "
-        "(copia `.env.example`) y agrega tu clave: `GEMINI_API_KEY=tu_clave_aqui`."
-    )
-    st.stop()
+if not os.getenv("LLAMA_API_URL"):
+    os.environ["LLAMA_API_URL"] = "http://127.0.0.1:8080/v1/chat/completions"
 
 # ---------------------------------------------------------------------------
 # Importar backend
@@ -436,7 +432,7 @@ with tab_evaluar:
                 resultado["meta"]["prompt"] = version_prompt
         else:
             with st.spinner(
-                f"🔄 Evaluando con Gemini (prompt `{version_prompt}`)..."
+                f"🔄 Evaluando con {os.getenv('LLAMA_MODEL', 'Gemma 4')} (prompt `{version_prompt}`)..."
             ):
                 try:
                     resultado = calificar(

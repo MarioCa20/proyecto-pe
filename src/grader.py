@@ -1,17 +1,49 @@
 import io
-import os, time, json
+import os, time, json, re
 from pathlib import Path
 from datetime import datetime
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
-from google import genai
-from google.genai import types, errors
+import requests
 import pandas as pd
 
 load_dotenv()
-MODELO = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")  # verifica el nombre vigente en AI Studio
-client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+LLAMA_API_URL = os.getenv("LLAMA_API_URL", "http://127.0.0.1:8080/v1/chat/completions")
+LLAMA_MODEL = os.getenv("LLAMA_MODEL", "gemma-4-E4B-it-Q4_K_M.gguf")
 
+
+
+def _obtener_esquema_calificacion() -> dict:
+    return {
+        "type": "object",
+        "properties": {
+            "criterios": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "criterio": {"type": "string"},
+                        "puntaje": {"type": "number"},
+                        "justificacion": {"type": "string"}
+                    },
+                    "required": [
+                        "criterio",
+                        "puntaje",
+                        "justificacion"
+                    ],
+                    "additionalProperties": False
+                }
+            },
+            "comentario_general": {
+                "type": "string"
+            }
+        },
+        "required": [
+            "criterios",
+            "comentario_general"
+        ],
+        "additionalProperties": False
+    }
 
 def _remover_acentos(texto: str) -> str:
     """Remover acentos y ñ para comparacion flexible de columnas."""
@@ -143,7 +175,7 @@ def cargar_rubrica_excel(archivo) -> list[dict]:
     return rubrica
 
 
-# --- Esquema de salida (Gemini lo fuerza a devolver JSON válido) ---
+# --- Esquema de salida ---
 class CriterioCalificado(BaseModel):
     criterio: str
     puntaje: float
@@ -156,6 +188,37 @@ class Calificacion(BaseModel):
 
 def cargar_prompt(version: str = "v1") -> str:
     return Path(f"prompts/{version}.md").read_text(encoding="utf-8")
+
+
+# --- Extracción de JSON de la respuesta del modelo ---
+def _extraer_json(texto: str) -> str | None:
+    """Intenta extraer un bloque JSON válido del texto del modelo.
+
+    El modelo local puede responder:
+      - JSON puro
+      - JSON rodeado de ```json ... ```
+      - JSON rodeado de ``` ... ```
+      - Texto libre + JSON al final
+    """
+    # 1. Buscar bloque ```json ... ``` o ``` ... ```
+    bloque = re.search(r'```(?:json)?\s*\n(.*?)\n```', texto, re.DOTALL)
+    if bloque:
+        return bloque.group(1).strip()
+
+    # 2. Buscar el primer { ... } válido
+    inicio = texto.find('{')
+    if inicio == -1:
+        return None
+
+    # Intentar múltiples cierres
+    for fin in range(texto.rfind('}'), inicio - 1, -1):
+        candidato = texto[inicio:fin + 1]
+        try:
+            json.loads(candidato)
+            return candidato
+        except json.JSONDecodeError:
+            continue
+    return None
 
 
 def _validar(cal: Calificacion, rubrica: list[dict]) -> dict:
@@ -175,6 +238,68 @@ def _validar(cal: Calificacion, rubrica: list[dict]) -> dict:
     return {"criterios": resultado, "total": total,
             "total_max": sum(esperados.values()),
             "comentario_general": cal.comentario_general}
+
+
+def _llamar_llama(system_prompt: str, user_content: str,
+                   temperatura: float = 0.0, reintentos: int = 3) -> tuple[str, float]:
+    """Envía el prompt a llama.cpp y devuelve el texto crudo de la respuesta.
+
+    Usa el endpoint /v1/chat/completions compatible con OpenAI.
+    """
+    mensajes = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content},
+    ]
+
+    payload = {
+        "model": LLAMA_MODEL,
+        "messages": mensajes,
+        "temperature": temperatura,
+        "max_tokens": 4096,
+        "stream": False,
+        "response_format": {
+            "type": "json_schema",
+            "schema": _obtener_esquema_calificacion()
+        }
+    }
+    ultimo_error = None
+    for intento in range(reintentos):
+        try:
+            t0 = time.time()
+            resp = requests.post(LLAMA_API_URL, json=payload, timeout=300)
+            resp.raise_for_status()
+            data = resp.json()
+
+            # Verificar que hay choices
+            if not data.get("choices"):
+                raise ValueError("La respuesta no contiene 'choices': " + str(data)[:500])
+
+            contenido = data["choices"][0]["message"]["content"]
+            if not contenido:
+                raise ValueError("La respuesta está vacía")
+
+            segundos = round(time.time() - t0, 2)
+            return contenido, segundos
+
+        except requests.exceptions.ConnectionError as e:
+            ultimo_error = e
+            if intento < reintentos - 1:
+                time.sleep(2 ** intento)
+                continue
+            raise ConnectionError(f"No se pudo conectar a {LLAMA_API_URL}: {e}")
+        except requests.exceptions.Timeout as e:
+            ultimo_error = e
+            if intento < reintentos - 1:
+                time.sleep(2 ** intento)
+                continue
+            raise TimeoutError(f"Timeout al llamar a {LLAMA_API_URL}: {e}")
+        except (requests.exceptions.RequestException, ValueError) as e:
+            ultimo_error = e
+            if intento < reintentos - 1:
+                continue
+            raise RuntimeError(f"Falló al llamar a llama.cpp tras {reintentos} intentos: {e}")
+
+    raise RuntimeError(f"Falló tras {reintentos} intentos: {ultimo_error}")
 
 
 def calificar(rubrica: list[dict], respuesta: str,
@@ -200,37 +325,29 @@ def calificar(rubrica: list[dict], respuesta: str,
         f"RESPUESTA DEL ESTUDIANTE:\n<<<\n{respuesta}\n>>>"
     )
 
-    config = types.GenerateContentConfig(
-        system_instruction=sistema,
-        temperature=indice_libertad,
-        response_mime_type="application/json",
-        response_schema=Calificacion,
-    )
-
     ultimo_error = None
     for intento in range(reintentos):
         try:
-            t0 = time.time()
-            r = client.models.generate_content(model=MODELO, contents=contenido, config=config)
-            salida = _validar(r.parsed, rubrica)
+            texto_raw, segundos = _llamar_llama(sistema, contenido, indice_libertad, reintentos=1)
+            # Extraer JSON del texto
+            json_str = _extraer_json(texto_raw)
+            if json_str is None:
+                raise ValueError(f"No se pudo extraer JSON de la respuesta del modelo. Texto: {texto_raw[:300]}")
+            cal = Calificacion.model_validate(json.loads(json_str))
+            salida = _validar(cal, rubrica)
             salida["meta"] = {
-                "modelo": MODELO,
+                "modelo": LLAMA_MODEL,
+                "api_url": LLAMA_API_URL,
                 "prompt": version_prompt,
                 "indice_libertad": indice_libertad,
                 "temperatura": indice_libertad,
-                "segundos": round(time.time() - t0, 2),
+                "segundos": segundos,
             }
             return salida
-        except errors.APIError as e:
+        except (ValueError, TypeError) as e:
             ultimo_error = e
-            if e.code in (429, 500, 503):          # cuota o servidor saturado
-                time.sleep(2 ** intento)           # backoff: 1s, 2s, 4s
-                continue
-            raise                                  # 400/401/403: no tiene sentido reintentar
-        except (ValueError, TypeError) as e:       # JSON inválido o fuera de rúbrica
-            ultimo_error = e
-            continue
-    raise RuntimeError(f"Falló tras {reintentos} intentos: {ultimo_error}")
+        if intento == reintentos - 1:
+            raise RuntimeError(f"Falló tras {reintentos} intentos: {ultimo_error}")
 
 
 def cargar_respuestas_excel(archivo) -> list[dict]:
@@ -347,10 +464,11 @@ def calificar_multipartida(
                 "total": None,
                 "total_max": sum(c["max_puntos"] for c in rubrica),
                 "criterios": [],
-                "comentario_general": f"",
+                "comentario_general": "",
                 "error": str(e),
                 "meta": {
-                    "modelo": MODELO,
+                    "modelo": LLAMA_MODEL,
+                    "api_url": LLAMA_API_URL,
                     "prompt": version_prompt,
                     "indice_libertad": indice_libertad,
                     "temperatura": indice_libertad,

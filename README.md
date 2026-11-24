@@ -1,6 +1,6 @@
 # Calificador Automático con IA
 
-Aplicación web que califica respuestas de estudiantes a partir de una rúbrica, usando la API de Google Gemini. Devuelve un puntaje por criterio, su justificación y la nota total, de forma individual o masiva.
+Aplicación web que califica respuestas de estudiantes a partir de una rúbrica, usando un modelo de IA local con llama.cpp. Devuelve un puntaje por criterio, su justificación y la nota total, de forma individual o masiva.
 
 > Proyecto del curso de Prompt Engineering — Equipo 5.
 
@@ -17,7 +17,8 @@ Aplicación web que califica respuestas de estudiantes a partir de una rúbrica,
 ## Requisitos previos
 
 - Python 3.10 o superior
-- Una clave de API de Gemini ([Google AI Studio](https://aistudio.google.com/apikey))
+- [llama.cpp](https://github.com/ggerganov/llama.cpp) con `llama-server` instalado
+- Un modelo GGUF (por ejemplo, Gemma 4)
 
 ## Instalación
 
@@ -30,18 +31,30 @@ source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-## Configuración
+## Configuración del modelo local
 
-Copia el archivo de ejemplo y agrega tu clave:
+1. Inicia llama-server con tu modelo:
+
+```bash
+# Ejemplo:
+/usr/bin/llama-server \
+    -m "/home/anorak/Models/Gemma 4/gemma-4-E4B-it-Q4_K_M.gguf" \
+    -ngl 99 \
+    --host 127.0.0.1 \
+    --port 8080 \
+    --jinja
+```
+
+2. Copia el archivo de configuración:
 
 ```bash
 cp .env.example .env
 ```
 
-| Variable         | Obligatoria | Descripción                                              |
-| ---------------- | ----------- | -------------------------------------------------------- |
-| `GEMINI_API_KEY` | Sí          | Clave de la API de Gemini.                               |
-| `GEMINI_MODEL`   | No          | Modelo a usar (por defecto `gemini-3.5-flash-lite`).     |
+| Variable        | Obligatoria | Descripción                                                       |
+| --------------- | ----------- | ----------------------------------------------------------------- |
+| `LLAMA_API_URL` | No          | URL del endpoint de chat. Por defecto `http://127.0.0.1:8080/v1/chat/completions` |
+| `LLAMA_MODEL`   | No          | Nombre del modelo en la petición. Por defecto `gemma-4-E4B-it-Q4_K_M.gguf` |
 
 > Nunca subas tu archivo `.env` al repositorio (ya está en `.gitignore`).
 
@@ -77,7 +90,7 @@ Cada criterio requiere un nombre, una descripción y un puntaje máximo:
 .
 ├── app.py              # Interfaz Streamlit
 ├── src/
-│   └── grader.py       # Lógica de calificación y cliente Gemini
+│   └── grader.py       # Lógica de calificación y cliente llama.cpp
 ├── prompts/            # Versiones del prompt de evaluación (v1–v4)
 ├── tests/              # Pruebas con pytest
 ├── data/               # Datos de demo (ver sección «Datos de demo»)
@@ -119,8 +132,8 @@ Libros incluidos: 1984, Drácula, Dr. Jekyll y Mr. Hyde, El corazón delator, El
 ## Pruebas
 
 ```bash
-pytest                  # pruebas unitarias
-pytest -m live          # incluye llamadas reales a la API (consume cuota)
+pytest                  # pruebas unitarias (no requieren modelo local)
+pytest -m live          # incluye llamadas reales al servidor llama.cpp
 ```
 
 ## Versionado de prompts

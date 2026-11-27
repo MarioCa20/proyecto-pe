@@ -22,15 +22,24 @@ st.set_page_config(
 )
 
 # ---------------------------------------------------------------------------
-# Clave API
+# Proveedores de IA (cualquiera sirve; Gemini ya no es obligatorio)
 # ---------------------------------------------------------------------------
-if not any(os.getenv(v) for v in ("GEMINI_API_KEY", "GROQ_API_KEY", "OPENROUTER_API_KEY", "OLLAMA_MODEL")):
+_ORDEN = [p.strip().lower() for p in os.getenv(
+    "LLM_FALLBACK_ORDER", "gemini,groq,openrouter,ollama,llama").split(",") if p.strip()]
+_HAY_NUBE_U_OLLAMA = any(os.getenv(v) for v in ("GEMINI_API_KEY", "GROQ_API_KEY", "OPENROUTER_API_KEY", "OLLAMA_MODEL"))
+if not _HAY_NUBE_U_OLLAMA and "llama" not in _ORDEN:
     st.error(
         "No hay ningún proveedor de IA configurado. Crea un archivo `.env` en la raíz del proyecto "
         "(copia `.env.example`) y agrega al menos `GEMINI_API_KEY`, `GROQ_API_KEY`, "
-        "`OPENROUTER_API_KEY` u `OLLAMA_MODEL`."
+        "`OPENROUTER_API_KEY`, `OLLAMA_MODEL` o usa el servidor local llama.cpp (`LLAMA_API_URL`)."
     )
     st.stop()
+if not _HAY_NUBE_U_OLLAMA:
+    st.info(
+        "Solo está disponible el modelo local de llama.cpp "
+        f"(`{os.getenv('LLAMA_API_URL', 'http://127.0.0.1:8080/v1/chat/completions')}`). "
+        "Asegúrate de que `llama-server` esté corriendo."
+    )
 
 # ---------------------------------------------------------------------------
 # Importar backend
@@ -437,7 +446,7 @@ with tab_evaluar:
                 resultado["meta"]["prompt"] = version_prompt
         else:
             with st.spinner(
-                f"🔄 Evaluando con Gemini (prompt `{version_prompt}`)..."
+                f"🔄 Evaluando con IA (prompt `{version_prompt}`, modelo local de respaldo: {os.getenv('LLAMA_MODEL', 'Gemma 4')})..."
             ):
                 try:
                     resultado = calificar(
